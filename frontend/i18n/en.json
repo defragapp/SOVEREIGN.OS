@@ -1,0 +1,198 @@
+{
+  "app": {
+    "name": "SOVEREIGN.OS",
+    "tagline": "Intelligence that answers to you.",
+    "loading": "Awakening…",
+    "error_boundary": "Something shifted unexpectedly. We're restoring clarity.",
+    "offline": "You're offline. Your work is preserved locally."
+  },
+  "nav": {
+    "home": "Home",
+    "launcher": "Launcher",
+    "loop": "The Loop",
+    "context": "Context",
+    "synthesis": "Synthesis",
+    "observatory": "Observatory",
+    "settings": "Settings",
+    "billing": "Credits & Plan"
+  },
+  "auth": {
+    "sign_in": "Enter SOVEREIGN",
+    "sign_in_google": "Continue with Google",
+    "sign_in_apple": "Continue with Apple",
+    "sign_in_email": "Continue with Email",
+    "email_sent": "A portal link has been sent to {{email}}. Check your inbox.",
+    "email_placeholder": "your@email.com",
+    "verify_heading": "Check your inbox",
+    "verify_body": "We've sent a secure link to {{email}}. It expires in 10 minutes.",
+    "error_blocked": "This email domain is not permitted.",
+    "error_generic": "Something went wrong. Please try again.",
+    "sign_out": "Leave SOVEREIGN",
+    "welcome_back": "Welcome back, {{name}}."
+  },
+  "alignment": {
+    "heading": "Alignment Evaluation",
+    "description": "Evaluating coherence between intent and output.",
+    "status_aligned": "Aligned",
+    "status_misaligned": "Misaligned",
+    "status_uncertain": "Uncertain",
+    "score_label": "Alignment Score",
+    "reasoning_label": "Reasoning",
+    "recommendations_label": "Recommendations",
+    "run_cta": "Evaluate Alignment",
+    "streaming_cta": "Evaluate (Streaming)",
+    "loading": "Evaluating…",
+    "queued": "Your evaluation is queued and will resume automatically.",
+    "error_retry": "Evaluation encountered an issue. Retry when ready.",
+    "empty_prompt": "Describe the agent output or decision to evaluate."
+  },
+  "compression": {
+    "heading": "Context Compression",
+    "description": "Distilling signal from volume.",
+    "format_summary": "Narrative Summary",
+    "format_bullet": "Key Points",
+    "format_json": "Structured Data",
+    "ratio_label": "Compression Target",
+    "run_cta": "Compress Context",
+    "loading": "Distilling…",
+    "result_label": "Compressed Output",
+    "stats_label": "{{original}} → {{compressed}} characters ({{ratio}}% of original)",
+    "queued": "Compression queued. Will resume when the service is available.",
+    "preserve_keys_placeholder": "Terms to preserve verbatim, comma-separated"
+  },
+  "simulator": {
+    "heading": "Loop Simulator",
+    "description": "Run your agent through a live conversation stream.",
+    "placeholder": "What would you like to explore with your agent?",
+    "run_cta": "Begin Simulation",
+    "stop_cta": "End Simulation",
+    "streaming": "Simulating…",
+    "token_count": "{{count}} tokens",
+    "empty_state": "No simulation in progress. Start a new one above.",
+    "queued": "Simulation queued."
+  },
+  "astrology": {
+    "heading": "Celestial Overlay",
+    "description": "Your natal blueprint mapped to today's cosmic currents.",
+    "natal_heading": "Natal Blueprint",
+    "transits_heading": "Active Transits",
+    "synthesis_heading": "Daily Synthesis",
+    "moon_phase": "Moon: {{phase}}",
+    "energy_harmonious": "Harmonious",
+    "energy_challenging": "Challenging",
+    "energy_neutral": "Neutral",
+    "loading": "Reading the sky…",
+    "cached_notice": "Synthesised {{timeAgo}}. Refreshes every 24 hours.",
+    "birth_data_required": "Add your birth date in Settings to unlock your natal blueprint.",
+    "no_birth_time": "Birth time not set — house positions are approximate.",
+    "update_birth_data": "Update Birth Data"
+  },
+  "synthesis": {
+    "heading": "Synthesis",
+    "description": "Weaving signals into unified clarity.",
+    "format_narrative": "Narrative",
+    "format_structured": "Structured",
+    "format_action_plan": "Action Plan",
+    "format_dashboard": "Dashboard Card",
+    "sources_label": "Sources",
+    "themes_label": "Dominant Themes",
+    "confidence_label": "Confidence",
+    "run_cta": "Synthesise",
+    "loading": "Weaving…",
+    "streaming": "Synthesising…",
+    "empty_state": "Add sources above, then synthesise."
+  },
+  "credits": {
+    "heading": "Credits & Plan",
+    "balance_label": "Available Credits",
+    "plan_label": "Current Plan",
+    "plan_free": "Free",
+    "plan_pro": "Pro",
+    "plan_enterprise": "Enterprise",
+    "buy_cta": "Acquire Credits",
+    "upgrade_cta": "Expand Access",
+    "low_credits_warning": "You have {{count}} credits remaining.",
+    "zero_credits": "You've used all available credits. Acquire more to continue.",
+    "transaction_history": "Credit History",
+    "credit_types": {
+      "provision": "Welcome credits",
+      "purchase": "Purchased",
+      "subscription_renewal": "Monthly allocation",
+      "alignment": "Alignment evaluation",
+      "compression": "Compression",
+      "embed": "Embedding",
+      "simulator": "Simulation",
+      "media": "Media production",
+      "refund": "Refunded"
+    }
+  },
+  "errors": {
+    "network": "Connection interrupted. Your work is safe.",
+    "server": "The service is temporarily resting. We'll retry shortly.",
+    "validation": "This input needs a small adjustment before proceeding.",
+    "not_found": "This path doesn't exist in the current configuration.",
+    "unauthorized": "Please sign in to access this.",
+    "insufficient_credits": "More credits are needed for this operation.",
+    "stream_timeout": "The stream took longer than expected. Please try again.",
+    "unknown": "An unexpected shift occurred. If this continues, reach out."
+  },
+  "settings": {
+    "heading": "Settings",
+    "profile_section": "Profile",
+    "display_name": "Display Name",
+    "email": "Email",
+    "birth_date": "Birth Date",
+    "birth_place": "Birth Place",
+    "timezone": "Timezone",
+    "save_cta": "Save Changes",
+    "saved": "Changes preserved.",
+    "danger_zone": "Account",
+    "sign_out_cta": "Sign Out",
+    "delete_account_cta": "Close Account",
+    "delete_confirm": "Closing your account is permanent and removes all data. This cannot be undone.",
+    "appearance_section": "Appearance",
+    "theme_dark": "Sovereign Dark",
+    "theme_light": "Sovereign Light",
+    "theme_system": "Follow System"
+  },
+  "landing": {
+    "hero_headline": "Your intelligence, sovereign.",
+    "hero_body": "SOVEREIGN.OS is the operating system for people who refuse to outsource their thinking. Powerful AI that answers to you — not the other way around.",
+    "hero_cta": "Enter SOVEREIGN",
+    "hero_cta_secondary": "Explore the architecture",
+    "features_heading": "Built for depth",
+    "feature_alignment": {
+      "title": "Alignment Engine",
+      "body": "Every AI output is evaluated against your principles before it reaches you."
+    },
+    "feature_loop": {
+      "title": "The Loop",
+      "body": "A continuous intelligence thread that accumulates context across time, never starting from zero."
+    },
+    "feature_synthesis": {
+      "title": "Synthesis",
+      "body": "Multiple signals woven into a single coherent understanding — in your voice."
+    },
+    "feature_astrology": {
+      "title": "Celestial Overlay",
+      "body": "Your natal blueprint meets today's transits. Cosmic context for earthly decisions."
+    },
+    "feature_sovereignty": {
+      "title": "Full Sovereignty",
+      "body": "Your data. Your context. Your rules. Running on infrastructure you control."
+    },
+    "social_proof": "Trusted by independent thinkers, builders, and visionaries.",
+    "pricing_heading": "Simple, transparent access",
+    "plan_free_name": "Free",
+    "plan_free_price": "0",
+    "plan_free_credits": "100 credits to begin",
+    "plan_pro_name": "Pro",
+    "plan_pro_price": "29",
+    "plan_pro_credits": "1,000 credits / month",
+    "plan_enterprise_name": "Enterprise",
+    "plan_enterprise_price": "Custom",
+    "plan_enterprise_credits": "5,000+ credits / month",
+    "plan_cta": "Begin",
+    "footer_copy": "© 2026 SOVEREIGN.OS. Intelligence that answers to you."
+  }
+}
