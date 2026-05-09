@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://sovereign.os/schemas/agent-manifest.json",
+  "title": "SOVEREIGN Agent Manifest",
+  "description": "Defines the capabilities, constraints, and identity of a SOVEREIGN.OS agent.",
+  "type": "object",
+  "required": ["agent_id","name","version","description","capabilities","models","alignment","rate_limits","created_at","updated_at"],
+  "additionalProperties": false,
+  "properties": {
+    "agent_id": { "type": "string", "format": "uuid" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "description": { "type": "string", "maxLength": 2048 },
+    "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
+    "capabilities": {
+      "type": "array", "minItems": 1, "maxItems": 32,
+      "items": {
+        "type": "object",
+        "required": ["name","description","operation"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "operation": { "type": "string", "enum": ["alignment","compression","simulator","embed","synthesis","astrology","media"] },
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" },
+          "credits_per_call": { "type": "integer", "minimum": 0, "default": 1 }
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "required": ["primary"],
+      "properties": {
+        "primary": { "type": "string" },
+        "fallback": { "type": "string" },
+        "embedding": { "type": "string", "default": "text-embedding-004" }
+      }
+    },
+    "alignment": {
+      "type": "object",
+      "required": ["threshold","auto_block_below"],
+      "properties": {
+        "threshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.75 },
+        "auto_block_below": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.4 },
+        "require_human_review_below": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.6 },
+        "safety_categories": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "embedding_dim": { "type": "integer", "default": 768 },
+    "max_context_tokens": { "type": "integer", "default": 128000 },
+    "rate_limits": {
+      "type": "object",
+      "required": ["requests_per_minute","tokens_per_day"],
+      "properties": {
+        "requests_per_minute": { "type": "integer", "minimum": 1, "default": 60 },
+        "tokens_per_day": { "type": "integer", "minimum": 1, "default": 1000000 },
+        "concurrent_streams": { "type": "integer", "minimum": 1, "default": 5 }
+      }
+    },
+    "security": {
+      "type": "object",
+      "properties": {
+        "allowed_origins": { "type": "array", "items": { "type": "string" } },
+        "require_auth": { "type": "boolean", "default": true },
+        "pii_redaction": { "type": "boolean", "default": true },
+        "audit_log": { "type": "boolean", "default": true }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}

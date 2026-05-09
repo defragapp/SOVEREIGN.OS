@@ -1,0 +1,79 @@
+# wrangler.toml — Sovereign AI Switchboard
+# https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "sovereign-switchboard"
+main = "workers/switchboard/src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ─── Account / Zone ───────────────────────────────────────────────────────────
+# Replace with your actual account_id — never commit secrets here.
+# account_id = "YOUR_CF_ACCOUNT_ID"   # set via CF_ACCOUNT_ID env var in CI
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+[[routes]]
+pattern = "api.sovereign.os/*"
+zone_name = "sovereign.os"
+
+# ─── Environments ─────────────────────────────────────────────────────────────
+
+[env.staging]
+name = "sovereign-switchboard-staging"
+vars = { ENVIRONMENT = "staging" }
+
+[[env.staging.routes]]
+pattern = "api-staging.sovereign.os/*"
+zone_name = "sovereign.os"
+
+[env.production]
+name = "sovereign-switchboard-production"
+vars = { ENVIRONMENT = "production" }
+
+[[env.production.routes]]
+pattern = "api.sovereign.os/*"
+zone_name = "sovereign.os"
+
+# ─── Build ────────────────────────────────────────────────────────────────────
+
+[build]
+command = "npm run build:worker"
+
+# ─── Variables (non-secret) ───────────────────────────────────────────────────
+# All secret values are injected via `wrangler secret put` — never put them here.
+
+[vars]
+ENVIRONMENT = "development"
+
+# ─── Observability ────────────────────────────────────────────────────────────
+
+[observability]
+enabled = true
+head_sampling_rate = 1  # 100% sampling; reduce to 0.1 in production for cost control
+
+# ─── Limits ───────────────────────────────────────────────────────────────────
+
+[limits]
+# CPU time limit per request (ms). Workers Paid plan max is 30,000 ms.
+cpu_ms = 30000
+
+# ─── Placement ────────────────────────────────────────────────────────────────
+
+[placement]
+mode = "smart"   # Cloudflare Smart Placement — routes requests to optimal PoP
+
+# ─── Secrets checklist (values set via `wrangler secret put` — see docs/worker-deploy.md)
+# The following secrets MUST be configured before deploying:
+#
+#   wrangler secret put GEMINI_API_KEY              --env staging
+#   wrangler secret put SUPABASE_URL                --env staging
+#   wrangler secret put SUPABASE_SERVICE_ROLE_KEY   --env staging
+#   wrangler secret put FOUNDRY_API_URL             --env staging
+#   wrangler secret put FOUNDRY_API_KEY             --env staging
+#   wrangler secret put WEBHOOK_SECRET              --env staging
+#   wrangler secret put SENTRY_DSN                  --env staging   # optional
+#   wrangler secret put DATADOG_API_KEY             --env staging   # optional
+#   wrangler secret put S3_BUCKET                   --env staging   # optional
+#   wrangler secret put S3_KEY                      --env staging   # optional
+#   wrangler secret put S3_SECRET                   --env staging   # optional
+#
+# Repeat for --env production after staging smoke tests pass.
