@@ -1,221 +1,177 @@
-/**
- * stream_helpers.ts
- * Converts Vercel AI SDK streams into standard Cloudflare Workers Response streams.
- * Supports both SSE (text/event-stream) and raw NDJSON chunked responses.
- */
+// workers/switchboard/src/stream_helpers.ts
+// Converts Vercel AI SDK streams → standard Web API Response streams.
+// Also provides SSE formatting and timeout wrappers for edge compute.
 
-import type { StreamTextResult, CoreMessage } from "ai";
+import type { StreamTextResult } from "ai";
 
-// ─── SSE helpers ──────────────────────────────────────────────────────────────
+// ─── SSE helpers ─────────────────────────────────────────────────────────────
 
-/**
- * Formats a data payload as a Server-Sent Events chunk.
- */
-function sseChunk(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+export function sseEvent(data: string, event?: string, id?: string): string {
+  let msg = "";
+  if (id) msg += `id: ${id}\n`;
+  if (event) msg += `event: ${event}\n`;
+  msg += `data: ${data}\n\n`;
+  return msg;
 }
 
-function sseDone(): string {
-  return `event: done\ndata: [DONE]\n\n`;
+export function sseDone(): string {
+  return `data: [DONE]\n\n`;
 }
 
-// ─── SDK stream → SSE Response ────────────────────────────────────────────────
+// ─── SDK stream → Response (SSE) ─────────────────────────────────────────────
 
 /**
- * Converts a Vercel AI SDK `streamText` result into a Cloudflare Workers
- * `Response` with `Content-Type: text/event-stream`.
- *
- * Each text delta is emitted as:
- *   event: delta
- *   data: {"delta": "...chunk...", "session_id": "..."}
- *
- * When the stream ends, usage stats are emitted:
- *   event: usage
- *   data: {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}
- *
- *   event: done
- *   data: [DONE]
+ * Pipes a Vercel AI SDK streamText result into an SSE Response.
+ * Each text delta is emitted as a `data: <chunk>` SSE event.
+ * Terminates with `data: [DONE]`.
  */
-export function sdkStreamToSSE(
-  result: StreamTextResult<Record<string, unknown>, unknown>,
-  sessionId: string,
-  headers: Record<string, string> = {}
+export function sdkStreamToSse(
+  result: StreamTextResult<Record<string, never>, string>,
+  opts: { timeoutMs?: number } = {}
 ): Response {
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const writer = writable.getWriter();
+  const { timeoutMs = 55_000 } = opts; // stay under CF's 60s wall clock
   const encoder = new TextEncoder();
 
-  // Kick off async pump — do NOT await here so the Response is returned immediately.
-  (async () => {
-    try {
-      for await (const delta of result.textStream) {
-        const chunk = sseChunk("delta", { delta, session_id: sessionId });
-        await writer.write(encoder.encode(chunk));
-      }
-
-      // Emit usage after stream completes
-      const usage = await result.usage;
-      if (usage) {
-        await writer.write(
-          encoder.encode(
-            sseChunk("usage", {
-              prompt_tokens: usage.promptTokens,
-              completion_tokens: usage.completionTokens,
-              total_tokens: usage.totalTokens,
-            })
-          )
+  const stream = new ReadableStream({
+    async start(controller) {
+      const timeoutId = setTimeout(() => {
+        controller.enqueue(
+          encoder.encode(sseEvent(JSON.stringify({ error: "stream_timeout" }), "error"))
         );
+        controller.enqueue(encoder.encode(sseDone()));
+        controller.close();
+      }, timeoutMs);
+
+      try {
+        for await (const chunk of result.textStream) {
+          if (chunk) {
+            controller.enqueue(encoder.encode(sseEvent(JSON.stringify({ text: chunk }))));
+          }
+        }
+
+        // Emit final usage if available
+        const usage = await result.usage.catch(() => null);
+        if (usage) {
+          controller.enqueue(
+            encoder.encode(sseEvent(JSON.stringify({ usage }), "meta"))
+          );
+        }
+
+        controller.enqueue(encoder.encode(sseDone()));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "stream_error";
+        controller.enqueue(
+          encoder.encode(sseEvent(JSON.stringify({ error: message }), "error"))
+        );
+        controller.enqueue(encoder.encode(sseDone()));
+      } finally {
+        clearTimeout(timeoutId);
+        controller.close();
       }
+    },
+  });
 
-      await writer.write(encoder.encode(sseDone()));
-      await writer.close();
-    } catch (err) {
-      const errChunk = sseChunk("error", {
-        message: err instanceof Error ? err.message : "Stream error",
-      });
-      await writer.write(encoder.encode(errChunk));
-      await writer.close();
-    }
-  })();
-
-  return new Response(readable, {
-    status: 200,
+  return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Cache-Control": "no-cache, no-transform",
       "X-Accel-Buffering": "no",
       Connection: "keep-alive",
-      "Access-Control-Allow-Origin": "*", // tightened per-route via CORS middleware
-      ...headers,
     },
   });
 }
 
-// ─── SDK stream → NDJSON Response ────────────────────────────────────────────
+// ─── Raw ReadableStream → Response (SSE passthrough) ─────────────────────────
 
 /**
- * Converts an SDK stream result to newline-delimited JSON chunks.
- * Compatible with the Vercel AI SDK `useChat` hook's `streamProtocol: "text"`.
+ * Passes a raw ReadableStream (e.g. from Foundry) directly to the client as SSE.
+ * Useful when Foundry returns an SSE stream that we forward unchanged.
  */
-export function sdkStreamToNDJSON(
-  result: StreamTextResult<Record<string, unknown>, unknown>,
-  sessionId: string,
-  headers: Record<string, string> = {}
+export function rawStreamToResponse(
+  stream: ReadableStream<Uint8Array>,
+  opts: { timeoutMs?: number } = {}
 ): Response {
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const writer = writable.getWriter();
+  const { timeoutMs = 55_000 } = opts;
   const encoder = new TextEncoder();
 
-  (async () => {
-    try {
-      for await (const delta of result.textStream) {
-        const line = JSON.stringify({ type: "text", text: delta, session_id: sessionId });
-        await writer.write(encoder.encode(line + "\n"));
+  const timedStream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = stream.getReader();
+      const timeoutId = setTimeout(() => {
+        reader.cancel();
+        controller.enqueue(encoder.encode(sseDone()));
+        controller.close();
+      }, timeoutMs);
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        controller.enqueue(encoder.encode(sseDone()));
+      } catch {
+        controller.enqueue(encoder.encode(sseDone()));
+      } finally {
+        clearTimeout(timeoutId);
+        controller.close();
+        reader.releaseLock();
       }
+    },
+  });
 
-      const usage = await result.usage;
-      if (usage) {
-        const line = JSON.stringify({
-          type: "finish",
-          usage: {
-            prompt_tokens: usage.promptTokens,
-            completion_tokens: usage.completionTokens,
-            total_tokens: usage.totalTokens,
-          },
-        });
-        await writer.write(encoder.encode(line + "\n"));
+  return new Response(timedStream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
+// ─── JSON stream (NDJSON) ─────────────────────────────────────────────────────
+
+/**
+ * Streams newline-delimited JSON (NDJSON) records.
+ * Each record is a JSON object on its own line, terminated by a sentinel.
+ */
+export function ndjsonStream(
+  asyncIter: AsyncIterable<Record<string, unknown>>
+): Response {
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const record of asyncIter) {
+          controller.enqueue(encoder.encode(JSON.stringify(record) + "\n"));
+        }
+      } finally {
+        controller.close();
       }
+    },
+  });
 
-      await writer.close();
-    } catch (err) {
-      const line = JSON.stringify({
-        type: "error",
-        error: err instanceof Error ? err.message : "Stream error",
-      });
-      await writer.write(encoder.encode(line + "\n"));
-      await writer.close();
-    }
-  })();
-
-  return new Response(readable, {
-    status: 200,
+  return new Response(stream, {
     headers: {
       "Content-Type": "application/x-ndjson; charset=utf-8",
       "Cache-Control": "no-cache",
       "Transfer-Encoding": "chunked",
-      ...headers,
     },
   });
 }
 
-// ─── Timeout wrapper ──────────────────────────────────────────────────────────
+// ─── Utility: collect stream to string ────────────────────────────────────────
 
-/**
- * Wraps a streaming Response with an AbortController timeout.
- * If the stream does not complete within `timeoutMs`, the controller is aborted
- * and a 504 JSON error is returned instead.
- *
- * NOTE: Cloudflare Workers have a hard CPU-time limit. Use this to enforce
- * application-level streaming timeouts well within that boundary.
- */
-export async function withStreamTimeout(
-  streamFn: (signal: AbortSignal) => Promise<Response>,
-  timeoutMs = 25_000
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await streamFn(controller.signal);
-    clearTimeout(timer);
-    return response;
-  } catch (err) {
-    clearTimeout(timer);
-    if (controller.signal.aborted) {
-      return new Response(
-        JSON.stringify({
-          error: {
-            code: "STREAM_TIMEOUT",
-            message: `Stream exceeded ${timeoutMs}ms limit`,
-            retryable: true,
-          },
-        }),
-        {
-          status: 504,
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
-    throw err;
+export async function collectStream(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let result = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    result += decoder.decode(value, { stream: true });
   }
-}
-
-// ─── Request size guard ───────────────────────────────────────────────────────
-
-/**
- * Reads and validates the request body size.
- * Returns the parsed JSON or throws with a 413 payload.
- */
-export async function readBodyWithLimit(
-  request: Request,
-  maxBytes = 512_000
-): Promise<unknown> {
-  const contentLength = request.headers.get("content-length");
-  if (contentLength && parseInt(contentLength, 10) > maxBytes) {
-    throw Object.assign(
-      new Error(`Request body exceeds ${maxBytes} byte limit`),
-      { status: 413, code: "PAYLOAD_TOO_LARGE" }
-    );
-  }
-
-  const buffer = await request.arrayBuffer();
-  if (buffer.byteLength > maxBytes) {
-    throw Object.assign(
-      new Error(`Request body exceeds ${maxBytes} byte limit`),
-      { status: 413, code: "PAYLOAD_TOO_LARGE" }
-    );
-  }
-
-  const text = new TextDecoder().decode(buffer);
-  return JSON.parse(text);
+  result += decoder.decode(); // flush
+  return result;
 }

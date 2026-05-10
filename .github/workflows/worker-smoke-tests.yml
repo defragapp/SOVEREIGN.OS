@@ -1,0 +1,89 @@
+name: Worker Smoke Tests
+
+on:
+  schedule:
+    - cron: "0 9 * * *"  # Daily at 09:00 UTC (02:00 PDT)
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, production]
+      run_supabase_verify:
+        description: "Run Supabase DB verification"
+        required: false
+        default: "true"
+        type: boolean
+
+jobs:
+  smoke-test:
+    name: Smoke Test — ${{ github.event.inputs.target || 'staging' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      TARGET: ${{ github.event.inputs.target || 'staging' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set environment variables
+        run: |
+          if [ "$TARGET" = "production" ]; then
+            echo "WORKER_URL=https://api.sovereign.os" >> $GITHUB_ENV
+            echo "SUPABASE_URL=${{ secrets.PROD_SUPABASE_URL }}" >> $GITHUB_ENV
+            echo "SUPABASE_ANON_KEY=${{ secrets.PROD_SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+            echo "TEST_USER_ID=${{ secrets.PROD_TEST_USER_ID }}" >> $GITHUB_ENV
+          else
+            echo "WORKER_URL=https://api-staging.sovereign.os" >> $GITHUB_ENV
+            echo "SUPABASE_URL=${{ secrets.STAGING_SUPABASE_URL }}" >> $GITHUB_ENV
+            echo "SUPABASE_ANON_KEY=${{ secrets.STAGING_SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+            echo "TEST_USER_ID=${{ secrets.STAGING_TEST_USER_ID }}" >> $GITHUB_ENV
+          fi
+
+      - name: Run API smoke tests
+        run: node scripts/smoke-test.mjs
+        env:
+          GEMINI_API_KEY: ${{ secrets.STAGING_GEMINI_API_KEY }}
+
+      - name: Run Supabase verification
+        if: ${{ github.event.inputs.run_supabase_verify != 'false' }}
+        run: node scripts/supabase-verify.mjs
+        env:
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results-${{ github.run_id }}
+          path: /tmp/smoke-results.json
+          retention-days: 14
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔴 Daily smoke tests FAILED on *${{ env.TARGET }}*. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ Daily smoke tests passed on *${{ env.TARGET }}*"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
