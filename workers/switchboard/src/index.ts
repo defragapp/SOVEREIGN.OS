@@ -1,729 +1,543 @@
-// workers/switchboard/src/index.ts
-// Sovereign AI Switchboard — Hono v4 Cloudflare Worker
-// Entry point: all routes, middleware, CORS, rate-limiting, error handling.
+/**
+ * index.ts — SOVEREIGN.OS Switchboard Worker (v0.5.0)
+ * Hono v4 on Cloudflare Workers
+ * AI layer: Cloudflare Workers AI binding (env.AI) — no Gemini key required
+ *
+ * Includes PR #4 patches:
+ *  [HIGH] Idempotency: return actual response_json (not {cached: true})
+ *  [HIGH] waitUntil: Loop Supabase writes survive stream close
+ *  [MED]  Webhook: 64KB payload size guard before HMAC check
+ */
 
-import { Hono } from "hono";
-import { cors } from "hono/cors";
-import { logger } from "hono/logger";
-import { secureHeaders } from "hono/secure-headers";
-import { timing } from "hono/timing";
-import { z } from "zod";
-
-import { SupabaseClient } from "./supabase_client";
-import { FoundryClient } from "./foundry_client";
+import { Hono }                    from 'hono';
+import { cors }                    from 'hono/cors';
+import { streamSSE }               from 'hono/streaming';
+import { z }                       from 'zod';
+import { createClient }            from '@supabase/supabase-js';
 import {
-  generateStructured,
-  streamAI,
-  probeAI,
-  embedText,
-  MODELS,
-} from "./ai_client";
-import { sdkStreamToSse } from "./stream_helpers";
+  generateObject,
+  streamText,
+  generateEmbedding,
+  selectModel,
+  CF_MODEL_FAST,
+  CF_MODEL_STANDARD,
+  type AiEnv,
+  type AiMessage,
+} from './ai_client';
 import {
-  DispatchRequestSchema,
-  AlignmentRequestSchema,
-  AlignmentResponseSchema,
-  CompressionRequestSchema,
-  CompressionResponseSchema,
-  DefragRequestSchema,
+  DispatchSchema,
+  LauncherResponseSchema,
   DefragResponseSchema,
-  LoopRequestSchema,
-  WebhookEventSchema,
-  type AlignmentResponse,
-  type CompressionResponse,
-  type DefragResponse,
-  type HealthResponse,
-} from "./schemas";
+  AlignmentResponseSchema,
+  CompressionResponseSchema,
+  CovenantResponseSchema,
+  SimulatorResponseSchema,
+} from './schemas';
 
-// ─── Env bindings (declared in wrangler.toml) ─────────────────────────────────
-
-export interface Env {
-  GEMINI_API_KEY: string;
-  SUPABASE_URL: string;
+// ── Environment bindings ──────────────────────────────────────────────────────
+export type Env = AiEnv & {
+  // AI: AiBinding  ← inherited from AiEnv, bound via [ai] in wrangler.toml
+  SUPABASE_URL:              string;
   SUPABASE_SERVICE_ROLE_KEY: string;
-  FOUNDRY_API_URL: string;
-  FOUNDRY_API_KEY: string;
-  WORKER_HMAC_SECRET: string;
-  SENTRY_DSN?: string;
-  DATADOG_API_KEY?: string;
-  ENVIRONMENT: string; // "staging" | "production"
-}
-
-// ─── Allowed origins ──────────────────────────────────────────────────────────
-
-const ALLOWED_ORIGINS = [
-  "https://sovereign.os",
-  "https://www.sovereign.os",
-  "https://staging.sovereign.os",
-  "http://localhost:3000",
-  "http://localhost:3001",
-];
-
-// ─── Rate limit config per space ──────────────────────────────────────────────
-
-const RATE_LIMITS: Record<string, { windowHours: number; max: number } | null> = {
-  launcher: null,       // unlimited
-  defrag: { windowHours: 24, max: 3 },
-  alignment: { windowHours: 24, max: 5 },
-  the_loop: { windowHours: 24, max: 3 },
-  compression: null,    // pro — unlimited
-  covenant: null,       // pro — unlimited
+  WORKER_HMAC_SECRET:        string;
+  FOUNDRY_API_URL?:          string;
+  FOUNDRY_API_KEY?:          string;
 };
 
-// ─── Pro-only spaces ──────────────────────────────────────────────────────────
+type Vars = { userId: string };
 
-const PRO_SPACES = new Set(["compression", "covenant"]);
+// ── App ───────────────────────────────────────────────────────────────────────
+const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 
-// ─── App ──────────────────────────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
+app.use('*', cors({
+  origin:         ['https://sovereign.os', 'https://www.sovereign.os', 'http://localhost:3000'],
+  allowMethods:   ['GET', 'POST', 'OPTIONS'],
+  allowHeaders:   ['Content-Type', 'Authorization', 'X-Idempotency-Key'],
+  credentials:    true,
+  exposeHeaders:  ['X-Request-Id'],
+}));
 
-const app = new Hono<{ Bindings: Env }>();
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function sb(env: Env) {
+  return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false },
+  });
+}
 
-// ─── Global middleware ────────────────────────────────────────────────────────
+async function checkRateLimit(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  space: string,
+  maxPerDay: number,
+): Promise<boolean> {
+  const since = new Date();
+  since.setHours(0, 0, 0, 0);
+  const { count } = await supabase
+    .from('agent_runs')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('space', space)
+    .gte('created_at', since.toISOString());
+  return (count ?? 0) < maxPerDay;
+}
 
-app.use("*", timing());
-app.use("*", logger());
-app.use(
-  "*",
-  secureHeaders({
-    xContentTypeOptions: "nosniff",
-    xFrameOptions: "DENY",
-    referrerPolicy: "strict-origin-when-cross-origin",
-  })
-);
+async function getUserTier(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<'free' | 'pro'> {
+  const { data } = await supabase
+    .from('profiles')
+    .select('tier')
+    .eq('id', userId)
+    .single();
+  return (data?.tier as 'free' | 'pro') ?? 'free';
+}
 
-app.use(
-  "*",
-  cors({
-    origin: (origin) => (ALLOWED_ORIGINS.includes(origin) ? origin : null),
-    allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization", "X-Idempotency-Key", "X-Request-ID"],
-    exposeHeaders: ["X-Request-ID", "X-RateLimit-Remaining"],
-    maxAge: 86400,
-    credentials: true,
-  })
-);
+async function logRun(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  space: string,
+  prompt: string,
+  responseJson: unknown,
+  tokensUsed: number,
+  durationMs: number,
+  idempotencyKey?: string,
+): Promise<string> {
+  const { data } = await supabase
+    .from('agent_runs')
+    .insert({
+      user_id:         userId,
+      space,
+      prompt:          prompt.slice(0, 4096),
+      response_json:   responseJson,
+      tokens_used:     tokensUsed,
+      duration_ms:     durationMs,
+      idempotency_key: idempotencyKey ?? null,
+    })
+    .select('id')
+    .single();
+  return data?.id ?? '';
+}
 
-// ─── Request ID middleware ────────────────────────────────────────────────────
-
-app.use("*", async (c, next) => {
-  const requestId =
-    c.req.header("X-Request-ID") ?? crypto.randomUUID();
-  c.set("requestId" as never, requestId);
+// ── Auth middleware ───────────────────────────────────────────────────────────
+app.use('/dispatch', async (c, next) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const token = auth.slice(7);
+  const supabase = sb(c.env);
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) return c.json({ error: 'unauthorized' }, 401);
+  c.set('userId', user.id);
   await next();
-  c.res.headers.set("X-Request-ID", requestId);
 });
 
-// ─── Request size guard (256 KB hard limit) ────────────────────────────────
+// ── GET /health ───────────────────────────────────────────────────────────────
+app.get('/health', async (c) => {
+  const start = Date.now();
+  const supabase = sb(c.env);
 
-app.use("/dispatch", async (c, next) => {
-  const contentLength = c.req.header("Content-Length");
-  if (contentLength && parseInt(contentLength, 10) > 256_000) {
-    return c.json({ error: "Request body too large", code: "PAYLOAD_TOO_LARGE" }, 413);
-  }
-  return next();
-});
+  // DB check
+  const { error: dbErr } = await supabase.from('profiles').select('id').limit(1);
 
-// ─── /health ─────────────────────────────────────────────────────────────────
-
-app.get("/health", async (c) => {
-  const supabase = new SupabaseClient(c.env);
-  const foundry = new FoundryClient(c.env);
-
-  const [aiResult, dbResult, foundryResult] = await Promise.allSettled([
-    probeAI(c.env),
-    supabase
-      .select("agent_runs", { select: "id", limit: 1 })
-      .then(() => ({ ok: true, latency_ms: 0 }))
-      .catch(() => ({ ok: false, latency_ms: 0 })),
-    foundry.probe(),
-  ]);
-
-  const ai = aiResult.status === "fulfilled" ? aiResult.value : { ok: false, latency_ms: 0 };
-  const db = dbResult.status === "fulfilled" ? dbResult.value : { ok: false, latency_ms: 0 };
-  const fd = foundryResult.status === "fulfilled" ? foundryResult.value : { ok: false, latency_ms: 0 };
-
-  const allHealthy = ai.ok && db.ok;
-  const status: HealthResponse["status"] = allHealthy
-    ? "healthy"
-    : ai.ok || db.ok
-    ? "degraded"
-    : "unhealthy";
-
-  const body: HealthResponse = {
-    status,
-    version: "1.0.0",
-    timestamp: new Date().toISOString(),
-    checks: {
-      supabase: db.ok ? "ok" : "error",
-      ai: ai.ok ? "ok" : "error",
-      foundry: fd.ok ? "ok" : "error",
-    },
-    latency_ms: {
-      ai: ai.latency_ms,
-      db: db.latency_ms,
-      foundry: fd.latency_ms,
-    },
-  };
-
-  return c.json(body, allHealthy ? 200 : 503);
-});
-
-// ─── /dispatch ────────────────────────────────────────────────────────────────
-
-app.post("/dispatch", async (c) => {
-  const requestId = (c.get("requestId" as never) as string) ?? crypto.randomUUID();
-
-  // --- Parse outer envelope
-  let body: unknown;
+  // AI binding check — tiny call to confirm binding works
+  let aiStatus: 'ok' | 'degraded' = 'ok';
   try {
-    body = await c.req.json();
+    await c.env.AI.run(CF_MODEL_FAST, {
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+    });
   } catch {
-    return c.json({ error: "Invalid JSON", code: "BAD_REQUEST", request_id: requestId }, 400);
+    aiStatus = 'degraded';
   }
 
-  const envelope = DispatchRequestSchema.safeParse(body);
-  if (!envelope.success) {
-    return c.json(
-      { error: "Validation failed", code: "VALIDATION_ERROR", details: envelope.error.flatten(), request_id: requestId },
-      422
-    );
-  }
-
-  const { space, user_id, payload, idempotency_key } = envelope.data;
-  const supabase = new SupabaseClient(c.env);
-
-  // --- Idempotency check (webhook-grade — store key to prevent double-exec)
-  if (idempotency_key) {
-    const existing = await supabase
-      .selectOne("agent_runs", {
-        filters: { idempotency_key, user_id },
-        select: "id,status",
-      })
-      .catch(() => null);
-    if (existing) {
-      return c.json({ cached: true, message: "Idempotent response" }, 200);
-    }
-  }
-
-  // --- Pro gate
-  if (PRO_SPACES.has(space)) {
-    const profile = await supabase
-      .selectOne<{ tier: string }>("profiles", {
-        filters: { id: user_id },
-        select: "tier",
-      })
-      .catch(() => null);
-    if (!profile || profile.tier !== "pro") {
-      return c.json(
-        { error: "Pro subscription required", code: "UPGRADE_REQUIRED", request_id: requestId },
-        403
-      );
-    }
-  }
-
-  // --- Rate limit check (free spaces)
-  const rateConfig = RATE_LIMITS[space];
-  if (rateConfig) {
-    const { allowed, remaining } = await supabase.checkRateLimit(
-      user_id,
-      space,
-      rateConfig.windowHours,
-      rateConfig.max
-    );
-    c.res.headers.set("X-RateLimit-Remaining", String(remaining));
-    if (!allowed) {
-      return c.json(
-        { error: "Daily limit reached. Come back tomorrow.", code: "RATE_LIMITED", request_id: requestId },
-        429
-      );
-    }
-  }
-
-  // --- Route to space handler
-  try {
-    switch (space) {
-      case "alignment":
-        return handleAlignment(c, user_id, payload, requestId, supabase, idempotency_key);
-      case "compression":
-        return handleCompression(c, user_id, payload, requestId, supabase, idempotency_key);
-      case "defrag":
-        return handleDefrag(c, user_id, payload, requestId, supabase, idempotency_key);
-      case "the_loop":
-        return handleLoop(c, user_id, payload, requestId, supabase);
-      case "launcher":
-        return handleLauncher(c, user_id, payload, requestId, supabase);
-      case "covenant":
-        return handleCovenant(c, user_id, payload, requestId, supabase, idempotency_key);
-      default:
-        return c.json({ error: "Unknown space", code: "NOT_FOUND", request_id: requestId }, 404);
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Internal error";
-    await supabase.logRun({
-      user_id,
-      space,
-      model: "unknown",
-      status: "error",
-      error: message,
-      idempotency_key,
-    });
-    return c.json({ error: "Something went wrong. Please try again.", code: "INTERNAL_ERROR", request_id: requestId }, 500);
-  }
+  const healthy = !dbErr && aiStatus === 'ok';
+  return c.json(
+    {
+      status:    healthy ? 'healthy' : 'degraded',
+      checks:    { supabase: dbErr ? 'error' : 'ok', ai: aiStatus },
+      version:   '0.5.0',
+      ai_models: { standard: CF_MODEL_STANDARD, fast: CF_MODEL_FAST },
+      latency_ms: Date.now() - start,
+      timestamp:  new Date().toISOString(),
+    },
+    healthy ? 200 : 503,
+  );
 });
 
-// ─── Space handlers ────────────────────────────────────────────────────────────
+// ── POST /webhook ─────────────────────────────────────────────────────────────
+app.post('/webhook', async (c) => {
+  // [PR #4 PATCH — MED] 64KB payload guard before HMAC check
+  const contentLength = parseInt(c.req.header('content-length') ?? '0', 10);
+  if (contentLength > 65_536) return c.json({ error: 'payload_too_large' }, 413);
 
-async function handleAlignment(
-  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
-  userId: string,
-  payload: Record<string, unknown>,
-  requestId: string,
-  supabase: SupabaseClient,
-  idempotencyKey?: string
-) {
-  const parsed = AlignmentRequestSchema.safeParse(payload);
-  if (!parsed.success) {
-    return c.json(
-      { error: "Invalid alignment payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
-      422
-    );
-  }
-
-  const { dob, time_of_birth, timezone, question, depth } = parsed.data;
-  const start = Date.now();
-
-  const system = `You are the Alignment guide within Sovereign OS — a reflective astro-psychological intelligence. 
-You help users understand themselves through the lens of natal chart archetypes and Jungian depth psychology.
-Never use: generate, process, analyze, data, model, diagnose, pattern-match, algorithm.
-Always use: understand, discover, explore, find, feel, guide, reflect, move forward.
-Output strictly valid JSON matching the schema. No markdown code fences.`;
-
-  const prompt = `User's date of birth: ${dob}
-Time of birth: ${time_of_birth ?? "unknown"}
-Timezone: ${timezone}
-Depth: ${depth}
-${question ? `Question: ${question}` : "Provide a general natal reading."}
-
-Respond with a JSON object: { reading, archetypes (array, max 5), guidance, themes (array, max 7), generated_at (ISO datetime) }`;
-
-  const result = await generateStructured<AlignmentResponse>({
-    env: c.env,
-    modelKey: depth === "deep" ? "pro" : "flash",
-    schema: AlignmentResponseSchema,
-    schemaName: "AlignmentResponse",
-    system,
-    prompt,
-    temperature: 0.6,
-    maxTokens: depth === "deep" ? 3000 : 1200,
-  });
-
-  const latency = Date.now() - start;
-  await supabase.logRun({
-    user_id: userId,
-    space: "alignment",
-    model: depth === "deep" ? MODELS.pro : MODELS.flash,
-    input_tokens: result.usage?.promptTokens,
-    output_tokens: result.usage?.completionTokens,
-    latency_ms: latency,
-    status: "success",
-    idempotency_key: idempotencyKey,
-  });
-
-  return c.json(result.object, 200);
-}
-
-async function handleCompression(
-  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
-  userId: string,
-  payload: Record<string, unknown>,
-  requestId: string,
-  supabase: SupabaseClient,
-  idempotencyKey?: string
-) {
-  const parsed = CompressionRequestSchema.safeParse(payload);
-  if (!parsed.success) {
-    return c.json(
-      { error: "Invalid compression payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
-      422
-    );
-  }
-
-  const { content, mode, output_format, preserve_voice } = parsed.data;
-  const wordCountOriginal = content.split(/\s+/).filter(Boolean).length;
-  const start = Date.now();
-
-  const system = `You are Compression within Sovereign OS — you help users distill, reframe, and crystallise their thoughts.
-Never use: generate, process, analyze, data, model, diagnose, pattern-match, algorithm.
-Always use: understand, discover, explore, find, feel, guide, reflect, move forward.
-${preserve_voice ? "Preserve the user's authentic voice and tone." : ""}
-Output strictly valid JSON. No markdown fences.`;
-
-  const prompt = `Mode: ${mode}. Output format: ${output_format}.
-Content to ${mode}:
-${content}
-
-Respond with JSON: { compressed (string), word_count_original (${wordCountOriginal}), word_count_compressed (int), compression_ratio (float 0-1), mode ("${mode}"), generated_at (ISO datetime) }`;
-
-  const result = await generateStructured<CompressionResponse>({
-    env: c.env,
-    modelKey: "flash",
-    schema: CompressionResponseSchema,
-    schemaName: "CompressionResponse",
-    system,
-    prompt,
-    temperature: 0.4,
-    maxTokens: 2048,
-  });
-
-  const latency = Date.now() - start;
-  await supabase.logRun({
-    user_id: userId,
-    space: "compression",
-    model: MODELS.flash,
-    input_tokens: result.usage?.promptTokens,
-    output_tokens: result.usage?.completionTokens,
-    latency_ms: latency,
-    status: "success",
-    idempotency_key: idempotencyKey,
-  });
-
-  return c.json(result.object, 200);
-}
-
-async function handleDefrag(
-  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
-  userId: string,
-  payload: Record<string, unknown>,
-  requestId: string,
-  supabase: SupabaseClient,
-  idempotencyKey?: string
-) {
-  const parsed = DefragRequestSchema.safeParse(payload);
-  if (!parsed.success) {
-    return c.json(
-      { error: "Invalid defrag payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
-      422
-    );
-  }
-
-  const { entries, goal, output_format } = parsed.data;
-  const start = Date.now();
-
-  const system = `You are Defrag within Sovereign OS — you help users find hidden structure in their scattered thoughts.
-Never use: generate, process, analyze, data, model, diagnose, pattern-match, algorithm.
-Always use: understand, discover, explore, find, feel, guide, reflect, move forward.
-Output strictly valid JSON. No markdown fences.`;
-
-  const prompt = `Format: ${output_format}. Goal: ${goal ?? "surface natural clusters and insights"}.
-Entries (${entries.length}):
-${entries.map((e) => `[${e.id}] ${e.text}`).join("\n")}
-
-Respond with JSON: { clusters: [{ label, theme, entry_ids, insight }], overall_pattern, next_focus, generated_at }`;
-
-  const result = await generateStructured<DefragResponse>({
-    env: c.env,
-    modelKey: "flash",
-    schema: DefragResponseSchema,
-    schemaName: "DefragResponse",
-    system,
-    prompt,
-    temperature: 0.5,
-    maxTokens: 2000,
-  });
-
-  const latency = Date.now() - start;
-  await supabase.logRun({
-    user_id: userId,
-    space: "defrag",
-    model: MODELS.flash,
-    latency_ms: latency,
-    status: "success",
-    idempotency_key: idempotencyKey,
-  });
-
-  return c.json(result.object, 200);
-}
-
-async function handleLoop(
-  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
-  userId: string,
-  payload: Record<string, unknown>,
-  requestId: string,
-  supabase: SupabaseClient
-) {
-  const parsed = LoopRequestSchema.safeParse(payload);
-  if (!parsed.success) {
-    return c.json(
-      { error: "Invalid loop payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
-      422
-    );
-  }
-
-  const { agent_id, message, conversation_id, stream, embed } = parsed.data;
-
-  // Load agent manifest from Supabase
-  const agent = await supabase
-    .selectOne<{ system_prompt: string; model_preference: string; max_tokens: number; temperature: number }>("agent_manifests", {
-      filters: { id: agent_id },
-      select: "system_prompt,model_preference,max_tokens,temperature",
-    })
-    .catch(() => null);
-
-  if (!agent) {
-    return c.json({ error: "Agent not found", code: "NOT_FOUND", request_id: requestId }, 404);
-  }
-
-  // Store message in loop_messages
-  const convId = conversation_id ?? crypto.randomUUID();
-  await supabase.insert("loop_messages", {
-    conversation_id: convId,
-    user_id: userId,
-    agent_id,
-    role: "user",
-    content: message,
-    created_at: new Date().toISOString(),
-  }).catch(() => {});
-
-  // Generate embedding if requested
-  if (embed) {
-    const embedding = await embedText(c.env, message, "RETRIEVAL_DOCUMENT").catch(() => null);
-    if (embedding) {
-      await supabase.update(
-        "loop_messages",
-        { embedding: JSON.stringify(embedding) },
-        { conversation_id: convId, role: "user" }
-      ).catch(() => {});
-    }
-  }
-
-  const modelKey = agent.model_preference === "gemini-1.5-pro" ? "pro" : "flash";
-
-  if (stream) {
-    const result = streamAI({
-      env: c.env,
-      modelKey,
-      system: agent.system_prompt,
-      messages: [{ role: "user", content: message }],
-      temperature: agent.temperature,
-      maxTokens: agent.max_tokens,
-      abortSignal: c.req.raw.signal ?? undefined,
-    });
-
-    // Store assistant response async (best-effort)
-    result.text.then((text) => {
-      supabase.insert("loop_messages", {
-        conversation_id: convId,
-        user_id: userId,
-        agent_id,
-        role: "assistant",
-        content: text,
-        created_at: new Date().toISOString(),
-      }).catch(() => {});
-      supabase.logRun({ user_id: userId, space: "the_loop", model: agent.model_preference, status: "success" }).catch(() => {});
-    }).catch(() => {});
-
-    return sdkStreamToSse(result);
-  }
-
-  // Non-streaming fallback
-  const { generateText } = await import("ai");
-  const { createGoogleGenerativeAI } = await import("@ai-sdk/google");
-  const google = createGoogleGenerativeAI({ apiKey: c.env.GEMINI_API_KEY });
-  const res = await generateText({
-    model: google(agent.model_preference),
-    system: agent.system_prompt,
-    messages: [{ role: "user", content: message }],
-    temperature: agent.temperature,
-    maxTokens: agent.max_tokens,
-  });
-
-  await supabase.insert("loop_messages", {
-    conversation_id: convId,
-    user_id: userId,
-    agent_id,
-    role: "assistant",
-    content: res.text,
-    created_at: new Date().toISOString(),
-  }).catch(() => {});
-
-  return c.json({ text: res.text, conversation_id: convId, generated_at: new Date().toISOString() }, 200);
-}
-
-async function handleLauncher(
-  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
-  userId: string,
-  payload: Record<string, unknown>,
-  requestId: string,
-  supabase: SupabaseClient
-) {
-  // Launcher is the entry-point selector — routes to appropriate sub-space
-  const intent = z
-    .object({ intent: z.string().min(1).max(2000) })
-    .safeParse(payload);
-
-  if (!intent.success) {
-    return c.json({ error: "Provide an intent string", code: "VALIDATION_ERROR", request_id: requestId }, 422);
-  }
-
-  const system = `You are the Sovereign OS Launcher — a routing intelligence that guides users to the right space.
-Available spaces: defrag (scatter→structure), alignment (self-understanding), the_loop (agent conversation), compression (distill content), covenant (commitments).
-Output JSON: { suggested_space: string, reason: string, opening_question: string }`;
-
-  const result = await generateStructured({
-    env: c.env,
-    modelKey: "flash",
-    schema: z.object({
-      suggested_space: z.string(),
-      reason: z.string(),
-      opening_question: z.string(),
-    }),
-    schemaName: "LauncherResponse",
-    system,
-    prompt: `User intent: ${intent.data.intent}`,
-    temperature: 0.5,
-    maxTokens: 256,
-  });
-
-  await supabase.logRun({ user_id: userId, space: "launcher", model: MODELS.flash, status: "success" }).catch(() => {});
-  return c.json(result.object, 200);
-}
-
-async function handleCovenant(
-  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
-  userId: string,
-  payload: Record<string, unknown>,
-  requestId: string,
-  supabase: SupabaseClient,
-  idempotencyKey?: string
-) {
-  const parsed = z
-    .object({
-      commitment: z.string().min(10).max(2000),
-      timeframe: z.string().max(100).optional(),
-      reflection: z.string().max(2000).optional(),
-    })
-    .safeParse(payload);
-
-  if (!parsed.success) {
-    return c.json({ error: "Invalid covenant payload", code: "VALIDATION_ERROR", request_id: requestId }, 422);
-  }
-
-  const { commitment, timeframe, reflection } = parsed.data;
-  const system = `You are Covenant within Sovereign OS — a sacred space for making and honouring meaningful commitments.
-Help the user clarify, deepen, and find accountability in their commitments.
-Never use clinical or algorithmic language. Be warm, grounding, and present.
-Output JSON: { covenant_statement, witness_reflection, check_in_questions (array, max 3), generated_at }`;
-
-  const result = await generateStructured({
-    env: c.env,
-    modelKey: "pro",
-    schema: z.object({
-      covenant_statement: z.string(),
-      witness_reflection: z.string(),
-      check_in_questions: z.array(z.string()).max(3),
-      generated_at: z.string(),
-    }),
-    schemaName: "CovenantResponse",
-    system,
-    prompt: `Commitment: ${commitment}\nTimeframe: ${timeframe ?? "open"}\nReflection: ${reflection ?? "none"}`,
-    temperature: 0.65,
-    maxTokens: 1500,
-  });
-
-  await supabase.logRun({ user_id: userId, space: "covenant", model: MODELS.pro, status: "success", idempotency_key: idempotencyKey }).catch(() => {});
-  return c.json(result.object, 200);
-}
-
-// ─── /webhook ────────────────────────────────────────────────────────────────
-
-app.post("/webhook", async (c) => {
-  // HMAC-SHA256 verification
-  const signature = c.req.header("X-Sovereign-Signature");
   const rawBody = await c.req.text();
+  if (rawBody.length > 65_536) return c.json({ error: 'payload_too_large' }, 413);
 
-  if (!signature) {
-    return c.json({ error: "Missing signature", code: "UNAUTHORIZED" }, 401);
-  }
+  const signature = c.req.header('stripe-signature');
+  if (!signature) return c.json({ error: 'missing_signature' }, 400);
 
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(c.env.WORKER_HMAC_SECRET),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"]
-  );
-
-  const sigBytes = hexToBytes(signature);
-  const valid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    sigBytes,
-    new TextEncoder().encode(rawBody)
-  );
-
-  if (!valid) {
-    return c.json({ error: "Invalid signature", code: "FORBIDDEN" }, 403);
-  }
-
-  let body: unknown;
+  // HMAC-SHA256 verification (Stripe format: t=...,v1=...)
   try {
-    body = JSON.parse(rawBody);
-  } catch {
-    return c.json({ error: "Invalid JSON", code: "BAD_REQUEST" }, 400);
-  }
+    const parts   = Object.fromEntries(signature.split(',').map((p) => p.split('=')));
+    const ts      = parts['t'];
+    const v1      = parts['v1'];
+    if (!ts || !v1) return c.json({ error: 'invalid_signature_format' }, 400);
 
-  const event = WebhookEventSchema.safeParse(body);
-  if (!event.success) {
-    return c.json({ error: "Unknown event type", code: "VALIDATION_ERROR" }, 422);
-  }
+    const signedPayload = `${ts}.${rawBody}`;
+    const key   = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(c.env.WORKER_HMAC_SECRET),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign'],
+    );
+    const sig   = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signedPayload));
+    const hex   = Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    if (hex !== v1) return c.json({ error: 'signature_mismatch' }, 401);
 
-  const supabase = new SupabaseClient(c.env);
+    const event   = JSON.parse(rawBody);
+    const supabase = sb(c.env);
 
-  switch (event.data.type) {
-    case "stripe.checkout.session.completed": {
-      const { user_id, plan, stripe_customer_id, stripe_subscription_id } = event.data.data;
-      await supabase.upsert(
-        "profiles",
-        {
-          id: user_id,
-          tier: plan,
-          stripe_customer_id,
-          stripe_subscription_id,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "id" }
-      );
-      break;
+    // Idempotent event storage
+    const { error: insertErr } = await supabase.from('webhook_events').insert({
+      stripe_event_id: event.id,
+      event_type:      event.type,
+      payload:         event,
+      processed_at:    new Date().toISOString(),
+    });
+    if (insertErr && !insertErr.message.includes('duplicate')) {
+      console.error('webhook insert error:', insertErr.message);
     }
-    case "stripe.customer.subscription.deleted": {
-      const { user_id } = event.data.data;
-      await supabase.update("profiles", { tier: "free", stripe_subscription_id: null }, { id: user_id });
-      break;
-    }
-  }
 
-  return c.json({ received: true }, 200);
+    // Handle billing lifecycle
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      await supabase.from('profiles').update({
+        tier:                   'pro',
+        stripe_customer_id:     session.customer,
+        stripe_subscription_id: session.subscription,
+      }).eq('id', session.client_reference_id);
+      await supabase.from('credits_ledger').insert({
+        user_id: session.client_reference_id,
+        delta:   100,
+        reason:  'pro_subscription_activated',
+      });
+    }
+    if (event.type === 'customer.subscription.deleted') {
+      await supabase.from('profiles').update({ tier: 'free' })
+        .eq('stripe_subscription_id', event.data.object.id);
+    }
+    if (event.type === 'invoice.payment_failed') {
+      const inv = event.data.object;
+      await supabase.from('audit_log').insert({
+        action:  'payment_failed',
+        payload: { customer: inv.customer, amount_due: inv.amount_due },
+      });
+    }
+
+    return c.json({ received: true });
+  } catch (err) {
+    console.error('webhook error:', err);
+    return c.json({ error: 'webhook_processing_failed' }, 500);
+  }
 });
 
-// ─── Global 404 & error handler ───────────────────────────────────────────────
+// ── POST /dispatch ────────────────────────────────────────────────────────────
+app.post('/dispatch', async (c) => {
+  const userId = c.get('userId');
+  const body   = await c.req.json().catch(() => null);
+  if (!body)   return c.json({ error: 'invalid_json' }, 400);
 
-app.notFound((c) => c.json({ error: "Route not found", code: "NOT_FOUND" }, 404));
+  const parsed = DispatchSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'invalid_request', details: parsed.error.flatten() }, 400);
+  }
 
-app.onError((err, c) => {
-  console.error("[switchboard] unhandled error:", err);
-  return c.json({ error: "Internal server error", code: "INTERNAL_ERROR" }, 500);
+  const { space, prompt, options = {} } = parsed.data;
+  const idempotencyKey = c.req.header('X-Idempotency-Key') ?? body.idempotency_key;
+  const supabase = sb(c.env);
+
+  // [PR #4 PATCH — HIGH] Idempotency: return actual response_json, not {cached: true}
+  if (idempotencyKey) {
+    const { data: cached } = await supabase
+      .from('agent_runs')
+      .select('response_json')
+      .eq('user_id', userId)
+      .eq('space', space)
+      .eq('idempotency_key', idempotencyKey)
+      .not('response_json', 'is', null)
+      .single();
+    if (cached?.response_json) {
+      return c.json({ ...cached.response_json, _cached: true });
+    }
+  }
+
+  // Route
+  switch (space) {
+    case 'launcher':    return handleLauncher(c, userId, prompt, options, supabase, idempotencyKey);
+    case 'defrag':      return handleDefrag(c, userId, prompt, options, supabase, idempotencyKey);
+    case 'alignment':   return handleAlignment(c, userId, prompt, options, supabase, idempotencyKey);
+    case 'the_loop':    return handleTheLoop(c, userId, prompt, options, supabase, idempotencyKey);
+    case 'compression': return handleCompression(c, userId, prompt, options, supabase, idempotencyKey);
+    case 'covenant':    return handleCovenant(c, userId, prompt, options, supabase, idempotencyKey);
+    case 'simulator':   return handleSimulator(c, userId, prompt, options, supabase, idempotencyKey);
+    default: return c.json({ error: 'unknown_space' }, 400);
+  }
 });
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
+// ── Space handlers ────────────────────────────────────────────────────────────
 
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
+/** LAUNCHER — Suggest which space to use (3B model, fast) */
+async function handleLauncher(c: any, userId: string, prompt: string, _opts: any, supabase: any, iKey?: string) {
+  const t0  = Date.now();
+  const msgs: AiMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You are the SOVEREIGN.OS Launcher. Given the user\'s intent, decide which space they need. ' +
+        'Spaces: defrag (brain dump/clarity), alignment (values/purpose), the_loop (ongoing conversation), ' +
+        'compression (summarise/distil), covenant (commitments/promises), simulator (explore decisions). ' +
+        'Return JSON: { "space": "<name>", "confidence": 0-1, "reasoning": "<one sentence>" }',
+    },
+    { role: 'user', content: prompt },
+  ];
+  const result = await generateObject(c.env, {
+    model:             CF_MODEL_FAST,
+    messages:          msgs,
+    schema:            LauncherResponseSchema,
+    schemaDescription: '{ "space": string, "confidence": number, "reasoning": string }',
+  });
+  const runId = await logRun(supabase, userId, 'launcher', prompt, result, 0, Date.now() - t0, iKey);
+  return c.json({ ...result, run_id: runId });
 }
 
-// ─── Export ───────────────────────────────────────────────────────────────────
+/** DEFRAG — Brain dump → clarity (3B, rate-limited 3/day) */
+async function handleDefrag(c: any, userId: string, prompt: string, _opts: any, supabase: any, iKey?: string) {
+  const ok = await checkRateLimit(supabase, userId, 'defrag', 3);
+  if (!ok) return c.json({ error: 'rate_limit_exceeded', space: 'defrag', limit: 3, period: 'day' }, 429);
+
+  const t0  = Date.now();
+  const msgs: AiMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You are the Defrag space in SOVEREIGN.OS — a mental clarity engine. ' +
+        'The user is dumping raw thoughts. Extract structure and return: ' +
+        '{ "themes": [string], "tensions": [string], "clarity_statement": string, "next_action": string }',
+    },
+    { role: 'user', content: prompt },
+  ];
+  const result = await generateObject(c.env, {
+    model:             CF_MODEL_FAST,
+    messages:          msgs,
+    schema:            DefragResponseSchema,
+    schemaDescription: '{ "themes": string[], "tensions": string[], "clarity_statement": string, "next_action": string }',
+  });
+  const runId = await logRun(supabase, userId, 'defrag', prompt, result, 0, Date.now() - t0, iKey);
+  return c.json({ ...result, run_id: runId });
+}
+
+/** ALIGNMENT — Values/purpose work (8B deep or 3B standard, rate-limited 5/day) */
+async function handleAlignment(c: any, userId: string, prompt: string, opts: any, supabase: any, iKey?: string) {
+  const ok = await checkRateLimit(supabase, userId, 'alignment', 5);
+  if (!ok) return c.json({ error: 'rate_limit_exceeded', space: 'alignment', limit: 5, period: 'day' }, 429);
+
+  const depth = opts?.depth === 'deep' ? 'deep' : 'standard';
+  const model = selectModel('alignment', depth);
+  const t0    = Date.now();
+
+  const msgs: AiMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You are the Alignment space in SOVEREIGN.OS — a values and purpose clarifier. ' +
+        'Guide the user to understand what matters most. ' +
+        'Return: { "values_identified": [string], "alignment_score": 0-10, ' +
+        '"misalignments": [string], "purpose_statement": string, "recommended_actions": [string] }',
+    },
+    { role: 'user', content: prompt },
+  ];
+  const result = await generateObject(c.env, {
+    model,
+    messages:          msgs,
+    schema:            AlignmentResponseSchema,
+    schemaDescription: '{ "values_identified": string[], "alignment_score": number, "misalignments": string[], "purpose_statement": string, "recommended_actions": string[] }',
+  });
+  const runId = await logRun(supabase, userId, 'alignment', prompt, result, 0, Date.now() - t0, iKey);
+  return c.json({ ...result, depth, run_id: runId });
+}
+
+/** THE LOOP — Streaming multi-turn agent (8B, SSE, rate-limited 3/day) */
+async function handleTheLoop(c: any, userId: string, prompt: string, opts: any, supabase: any, iKey?: string) {
+  const ok = await checkRateLimit(supabase, userId, 'the_loop', 3);
+  if (!ok) return c.json({ error: 'rate_limit_exceeded', space: 'the_loop', limit: 3, period: 'day' }, 429);
+
+  const history: AiMessage[] = opts?.history ?? [];
+  const msgs: AiMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You are The Loop in SOVEREIGN.OS — a thoughtful, ongoing AI companion. ' +
+        'Engage deeply with the user\'s situation. Be concise, insightful, and action-oriented.',
+    },
+    ...history,
+    { role: 'user', content: prompt },
+  ];
+
+  const t0 = Date.now();
+
+  return streamSSE(c, async (stream) => {
+    let fullText = '';
+    try {
+      const cfStream = await streamText(c.env, { model: CF_MODEL_STANDARD, messages: msgs });
+      const reader   = cfStream.getReader();
+      const decoder  = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        // CF Workers AI streams as: data: {"response":"token"}\n\n
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') break;
+          try {
+            const parsed = JSON.parse(raw);
+            const token  = parsed?.response ?? '';
+            if (token) {
+              fullText += token;
+              await stream.writeSSE({ data: JSON.stringify({ token }) });
+            }
+          } catch { /* skip malformed chunk */ }
+        }
+      }
+
+      await stream.writeSSE({ data: JSON.stringify({ done: true }) });
+    } finally {
+      // [PR #4 PATCH — HIGH] waitUntil: persist run after stream closes
+      c.executionCtx.waitUntil(
+        logRun(supabase, userId, 'the_loop', prompt, { response: fullText }, 0, Date.now() - t0, iKey)
+          .then((runId) =>
+            supabase.from('loop_messages').insert([
+              { user_id: userId, role: 'user',      content: prompt,    run_id: runId },
+              { user_id: userId, role: 'assistant', content: fullText, run_id: runId },
+            ]),
+          )
+          .catch((e) => console.error('loop persist error:', e)),
+      );
+    }
+  });
+}
+
+/** COMPRESSION — Summarise/distil content (3B, pro = unlimited, free = 5/day) */
+async function handleCompression(c: any, userId: string, prompt: string, opts: any, supabase: any, iKey?: string) {
+  const tier = await getUserTier(supabase, userId);
+  if (tier === 'free') {
+    const ok = await checkRateLimit(supabase, userId, 'compression', 5);
+    if (!ok) return c.json({ error: 'rate_limit_exceeded', space: 'compression', limit: 5, period: 'day', upgrade: true }, 429);
+  }
+
+  const style = opts?.style ?? 'bullets'; // 'bullets' | 'prose' | 'tldr'
+  const t0    = Date.now();
+
+  const msgs: AiMessage[] = [
+    {
+      role: 'system',
+      content:
+        `You are the Compression space in SOVEREIGN.OS — a signal-extraction engine. ` +
+        `Distil the user's input to its essential core in "${style}" style. ` +
+        `Return: { "summary": string, "key_points": [string], "signal_strength": 0-10, "discarded_noise": [string] }`,
+    },
+    { role: 'user', content: prompt },
+  ];
+  const result = await generateObject(c.env, {
+    model:             CF_MODEL_FAST,
+    messages:          msgs,
+    schema:            CompressionResponseSchema,
+    schemaDescription: '{ "summary": string, "key_points": string[], "signal_strength": number, "discarded_noise": string[] }',
+  });
+
+  // Optional: generate embedding for compressed output
+  if (opts?.embed) {
+    try {
+      const vec = await generateEmbedding(c.env, result.summary);
+      await supabase.from('embeddings').insert({
+        user_id:  userId,
+        content:  result.summary,
+        embedding: vec,
+        metadata: { space: 'compression', source_length: prompt.length },
+      });
+    } catch (e) { console.warn('embedding failed:', e); }
+  }
+
+  const runId = await logRun(supabase, userId, 'compression', prompt, result, 0, Date.now() - t0, iKey);
+  return c.json({ ...result, run_id: runId });
+}
+
+/** COVENANT — Commitments and promises (8B, pro tier only) */
+async function handleCovenant(c: any, userId: string, prompt: string, _opts: any, supabase: any, iKey?: string) {
+  const tier = await getUserTier(supabase, userId);
+  if (tier !== 'pro') {
+    return c.json({ error: 'pro_required', space: 'covenant', message: 'Covenant requires a Pro subscription.' }, 403);
+  }
+
+  const t0 = Date.now();
+  const msgs: AiMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You are the Covenant space in SOVEREIGN.OS — a sacred commitment engine. ' +
+        'Help the user crystallise meaningful commitments and promises to themselves. ' +
+        'Be honest about difficulty. Return: ' +
+        '{ "covenant_statement": string, "commitments": [string], "accountability_triggers": [string], ' +
+        '"risk_of_breaking": string, "renewal_date": "YYYY-MM-DD" }',
+    },
+    { role: 'user', content: prompt },
+  ];
+  const result = await generateObject(c.env, {
+    model:             CF_MODEL_STANDARD,
+    messages:          msgs,
+    schema:            CovenantResponseSchema,
+    schemaDescription: '{ "covenant_statement": string, "commitments": string[], "accountability_triggers": string[], "risk_of_breaking": string, "renewal_date": string }',
+  });
+  const runId = await logRun(supabase, userId, 'covenant', prompt, result, 0, Date.now() - t0, iKey);
+  return c.json({ ...result, run_id: runId });
+}
+
+/** SIMULATOR — Explore decisions through scenarios (3B, all tiers) */
+async function handleSimulator(c: any, userId: string, prompt: string, opts: any, supabase: any, iKey?: string) {
+  const t0       = Date.now();
+  const numPaths = Math.min(opts?.paths ?? 3, 5);
+
+  const msgs: AiMessage[] = [
+    {
+      role: 'system',
+      content:
+        `You are the Simulator space in SOVEREIGN.OS — a decision-exploration engine. ` +
+        `Generate ${numPaths} distinct future paths for the user's situation. ` +
+        `Return: { "decision_context": string, "paths": [{ "title": string, "probability": 0-1, ` +
+        `"description": string, "upsides": [string], "downsides": [string], "first_step": string }], ` +
+        `"recommended_path": string }`,
+    },
+    { role: 'user', content: prompt },
+  ];
+  const result = await generateObject(c.env, {
+    model:             CF_MODEL_FAST,
+    messages:          msgs,
+    schema:            SimulatorResponseSchema,
+    schemaDescription: `{ "decision_context": string, "paths": Array<{title,probability,description,upsides,downsides,first_step}>, "recommended_path": string }`,
+  });
+  const runId = await logRun(supabase, userId, 'simulator', prompt, result, 0, Date.now() - t0, iKey);
+  return c.json({ ...result, run_id: runId });
+}
+
+// ── 404 ───────────────────────────────────────────────────────────────────────
+app.notFound((c) => c.json({ error: 'not_found' }, 404));
+app.onError((err, c) => {
+  console.error('unhandled error:', err);
+  return c.json({ error: 'internal_server_error', message: err.message }, 500);
+});
 
 export default app;

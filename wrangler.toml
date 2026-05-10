@@ -1,57 +1,36 @@
-# wrangler.toml — Sovereign AI Switchboard
-# Cloudflare Worker configuration for api.sovereign.os
-# Secrets are NEVER stored here — use: wrangler secret put <KEY> --env <env>
+# wrangler.toml — SOVEREIGN.OS Switchboard
+# AI layer: Cloudflare Workers AI (account-bound, no external key required)
+# Secrets required (5 per env, set via: wrangler secret put <NAME> --env <staging|production>):
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+#   WORKER_HMAC_SECRET   ← generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+#   FOUNDRY_API_URL
+#   FOUNDRY_API_KEY
+# GEMINI_API_KEY is no longer required — AI runs via the [ai] Workers AI binding below.
 
-name = "sovereign-switchboard"
-main = "workers/switchboard/src/index.ts"
-compatibility_date = "2024-09-23"
+name              = "sovereign-switchboard"
+main              = "src/index.ts"
+compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
-# ─── Observability ────────────────────────────────────────────────────────────
-[observability]
-enabled = true
-head_sampling_rate = 1
+# ── Cloudflare Workers AI binding ─────────────────────────────────────────────
+# Provides env.AI inside the Worker — zero config, no API key, account-scoped.
+# Free tier: 10,000 neurons/day (resets 00:00 UTC). Paid: $0.011/1K neurons.
+[ai]
+binding = "AI"
 
-# ─── Build ────────────────────────────────────────────────────────────────────
-[build]
-command = "cd workers/switchboard && npm install && npm run type-check"
-
-# ─── Limits ───────────────────────────────────────────────────────────────────
-[limits]
-cpu_ms = 50
-
-# ─── Default (local dev) environment ─────────────────────────────────────────
-[vars]
-ENVIRONMENT = "development"
-
-# ─── Staging environment ──────────────────────────────────────────────────────
+# ── Staging environment ────────────────────────────────────────────────────────
 [env.staging]
 name = "sovereign-switchboard-staging"
-route = { pattern = "api-staging.sovereign.os/*", zone_name = "sovereign.os" }
-vars = { ENVIRONMENT = "staging" }
 
-# Staging secrets (set with: wrangler secret put <KEY> --env staging):
-#   GEMINI_API_KEY
-#   SUPABASE_URL
-#   SUPABASE_SERVICE_ROLE_KEY
-#   FOUNDRY_API_URL
-#   FOUNDRY_API_KEY
-#   WORKER_HMAC_SECRET
-#   SENTRY_DSN
-#   DATADOG_API_KEY
+[[env.staging.routes]]
+pattern   = "api-staging.sovereign.os/*"
+zone_name = "sovereign.os"
 
-# ─── Production environment ───────────────────────────────────────────────────
+# ── Production environment ────────────────────────────────────────────────────
 [env.production]
 name = "sovereign-switchboard-production"
-route = { pattern = "api.sovereign.os/*", zone_name = "sovereign.os" }
-vars = { ENVIRONMENT = "production" }
 
-# Production secrets (set with: wrangler secret put <KEY> --env production):
-#   GEMINI_API_KEY
-#   SUPABASE_URL
-#   SUPABASE_SERVICE_ROLE_KEY
-#   FOUNDRY_API_URL
-#   FOUNDRY_API_KEY
-#   WORKER_HMAC_SECRET
-#   SENTRY_DSN
-#   DATADOG_API_KEY
+[[env.production.routes]]
+pattern   = "api.sovereign.os/*"
+zone_name = "sovereign.os"
