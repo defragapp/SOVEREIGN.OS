@@ -1,0 +1,14 @@
+@import "../../design/tokens/tokens.css";
+
+html,body,#root {
+  height:100%;
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-md);
+  color: var(--color-neutral-900);
+  background: var(--color-surface);
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+}
+
+.container { max-width: 1200px; margin: 0 auto; padding: 0 var(--space-4); }
+.card { background: var(--color-surface); box-shadow: var(--shadow-1); border-radius: 8px; padding: var(--space-4); }
