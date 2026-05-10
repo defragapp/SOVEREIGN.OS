@@ -1,0 +1,194 @@
+name: Worker Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "workers/switchboard/**"
+      - "wrangler.toml"
+      - ".github/workflows/worker-deploy.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, production]
+
+concurrency:
+  group: worker-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ─── Type-check & Unit Tests ──────────────────────────────────────────────
+  test:
+    name: Type-check & Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: workers/switchboard/package-lock.json
+
+      - name: Install dependencies
+        working-directory: workers/switchboard
+        run: npm ci
+
+      - name: Type-check
+        working-directory: workers/switchboard
+        run: npm run type-check
+
+      - name: Unit tests
+        working-directory: workers/switchboard
+        run: npm test -- --reporter=verbose
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: workers/switchboard/coverage/
+
+  # ─── Deploy to Staging ────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: workers/switchboard/package-lock.json
+
+      - name: Install dependencies
+        working-directory: workers/switchboard
+        run: npm ci
+
+      - name: Deploy to Staging
+        working-directory: workers/switchboard
+        run: npm run deploy:staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+      - name: Notify Slack (staging deployed)
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ Switchboard *staging* deployed from `${{ github.sha }}` by ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ─── Smoke Tests (Staging) ────────────────────────────────────────────────
+  smoke-staging:
+    name: Smoke Tests → Staging
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run smoke tests
+        run: node scripts/smoke-test.mjs
+        env:
+          WORKER_URL: https://api-staging.sovereign.os
+          SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.STAGING_SUPABASE_ANON_KEY }}
+          TEST_USER_ID: ${{ secrets.STAGING_TEST_USER_ID }}
+          GEMINI_API_KEY: ${{ secrets.STAGING_GEMINI_API_KEY }}
+
+      - name: Upload smoke test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results
+          path: /tmp/smoke-results.json
+
+  # ─── Manual Gate: Production Approval ────────────────────────────────────
+  approve-production:
+    name: Approve Production Deploy
+    needs: smoke-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production-gate  # Configure with required reviewers in GitHub Environments
+    steps:
+      - name: Production deploy approved
+        run: echo "Production deploy approved by ${{ github.actor }}"
+
+  # ─── Deploy to Production ─────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    needs: approve-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: workers/switchboard/package-lock.json
+
+      - name: Install dependencies
+        working-directory: workers/switchboard
+        run: npm ci
+
+      - name: Deploy to Production
+        working-directory: workers/switchboard
+        run: npm run deploy:production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+      - name: Sentry release
+        if: success()
+        run: |
+          curl -sX POST "https://sentry.io/api/0/organizations/${{ secrets.SENTRY_ORG }}/releases/" \
+            -H "Authorization: Bearer ${{ secrets.SENTRY_AUTH_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"version\": \"${{ github.sha }}\", \"projects\": [\"sovereign-switchboard\"]}"
+
+      - name: Notify Slack (production deployed)
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🚀 Switchboard *production* deployed from `${{ github.sha }}` by ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack (production failed)
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔴 Switchboard *production* deploy FAILED — `${{ github.sha }}` by ${{ github.actor }}. Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

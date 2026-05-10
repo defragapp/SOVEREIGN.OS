@@ -1,288 +1,372 @@
-# Sovereign AI Switchboard — Deployment Guide
+# Worker Deploy Guide — Sovereign AI Switchboard
 
-> **Worker:** `sovereign-switchboard`  
-> **Endpoint:** `https://api.sovereign.os`  
-> **Staging:** `https://api-staging.sovereign.os`  
-> **Stack:** Cloudflare Workers · Hono · Vercel AI SDK · Google Gemini
+> **Audience:** Engineers deploying or operating `sovereign-switchboard` (Cloudflare Worker).
+> **Last updated:** 2026-05-09
+
+---
+
+## Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [First-Time Setup](#first-time-setup)
+3. [Secrets Management](#secrets-management)
+4. [Local Development](#local-development)
+5. [Deploy to Staging](#deploy-to-staging)
+6. [Deploy to Production](#deploy-to-production)
+7. [Rollback](#rollback)
+8. [Secret Rotation](#secret-rotation)
+9. [Health Checks](#health-checks)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Prerequisites
 
-| Tool | Minimum Version | Install |
-|------|----------------|---------|
-| Node.js | 20 LTS | `nvm use 20` |
-| Wrangler CLI | 3.88+ | `npm i -g wrangler` |
-| Cloudflare account | — | `wrangler login` |
-| GitHub Actions secrets | — | See §3 |
+| Tool | Version | Install |
+|------|---------|---------|
+| Node.js | ≥ 20.x | `nvm install 20` |
+| wrangler | ≥ 3.80 | `npm i -g wrangler` |
+| CF account | Any plan | dashboard.cloudflare.com |
+
+Ensure you have access to:
+- Cloudflare account with Workers & Pages enabled
+- `CF_API_TOKEN` with **Edit Workers** permission
+- `CF_ACCOUNT_ID` (found in CF dashboard → right sidebar)
+- GitHub Environments: `staging`, `production-gate`, `production`
 
 ---
 
-## 1. First-Time Setup
-
-### 1.1 Clone and install
+## First-Time Setup
 
 ```bash
-git clone https://github.com/defragapp/SOVEREIGN.OS.git
-cd SOVEREIGN.OS
+# 1. Clone and navigate to the monorepo
+git clone git@github.com:your-org/sovereign-os.git
+cd sovereign-os
+
+# 2. Install Worker dependencies
+cd workers/switchboard
 npm install
-cd workers/switchboard && npm install
-```
 
-### 1.2 Authenticate Wrangler
-
-```bash
+# 3. Authenticate wrangler
 wrangler login
-# Verify: wrangler whoami
+
+# 4. Verify authentication
+wrangler whoami
+
+# 5. Set all secrets (see Secrets Management below)
+
+# 6. Deploy to staging
+npm run deploy:staging
 ```
-
-### 1.3 Create the Cloudflare zone route (one-time)
-
-Log in to the Cloudflare dashboard → **Workers & Pages** → select `sovereign-switchboard` → **Triggers** → **Add Custom Domain** → `api.sovereign.os`.
 
 ---
 
-## 2. Secret Provisioning
+## Secrets Management
 
-**All secrets are injected via `wrangler secret put` — never committed to the repository.**
+**NEVER** commit secrets to the repository. All Worker secrets are injected via `wrangler secret put`. The `.env.example` file at the repo root is for reference only.
 
-### 2.1 Staging secrets
+### Set secrets — Staging
 
 ```bash
-# Required
-wrangler secret put GEMINI_API_KEY            --env staging
-wrangler secret put SUPABASE_URL              --env staging
+wrangler secret put GEMINI_API_KEY --env staging
+wrangler secret put SUPABASE_URL --env staging
 wrangler secret put SUPABASE_SERVICE_ROLE_KEY --env staging
-wrangler secret put FOUNDRY_API_URL           --env staging
-wrangler secret put FOUNDRY_API_KEY           --env staging
-wrangler secret put WEBHOOK_SECRET            --env staging
-
-# Optional (observability)
-wrangler secret put SENTRY_DSN               --env staging
-wrangler secret put DATADOG_API_KEY          --env staging
-
-# Optional (media upload)
-wrangler secret put S3_BUCKET                --env staging
-wrangler secret put S3_KEY                   --env staging
-wrangler secret put S3_SECRET                --env staging
+wrangler secret put FOUNDRY_API_URL --env staging
+wrangler secret put FOUNDRY_API_KEY --env staging
+wrangler secret put WORKER_HMAC_SECRET --env staging
+wrangler secret put SENTRY_DSN --env staging          # optional
+wrangler secret put DATADOG_API_KEY --env staging     # optional
 ```
 
-### 2.2 Production secrets
+### Set secrets — Production
 
 ```bash
-wrangler secret put GEMINI_API_KEY            --env production
-wrangler secret put SUPABASE_URL              --env production
+wrangler secret put GEMINI_API_KEY --env production
+wrangler secret put SUPABASE_URL --env production
 wrangler secret put SUPABASE_SERVICE_ROLE_KEY --env production
-wrangler secret put FOUNDRY_API_URL           --env production
-wrangler secret put FOUNDRY_API_KEY           --env production
-wrangler secret put WEBHOOK_SECRET            --env production
-wrangler secret put SENTRY_DSN               --env production
-wrangler secret put DATADOG_API_KEY          --env production
+wrangler secret put FOUNDRY_API_URL --env production
+wrangler secret put FOUNDRY_API_KEY --env production
+wrangler secret put WORKER_HMAC_SECRET --env production
+wrangler secret put SENTRY_DSN --env production
+wrangler secret put DATADOG_API_KEY --env production
 ```
 
-### 2.3 GitHub Actions secrets
-
-Add these in **Settings → Secrets and variables → Actions**:
-
-| Secret | Value |
-|--------|-------|
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API token (Workers: Edit scope) |
-| `CLOUDFLARE_ACCOUNT_ID` | Your CF account ID |
-| `TEST_AGENT_ID` | UUID for smoke test agent |
-| `TEST_SESSION_ID` | UUID for smoke test session |
-| `SMOKE_TEST_SECRET` | Any random string |
-| `STAGING_SUPABASE_URL` | Staging Supabase project URL |
-| `STAGING_SUPABASE_SERVICE_ROLE_KEY` | Staging service role key |
-
-### 2.4 Verify secrets are set
+### List / verify secrets
 
 ```bash
 wrangler secret list --env staging
 wrangler secret list --env production
 ```
 
+### Generate WORKER_HMAC_SECRET
+
+```bash
+# Generate a cryptographically secure 32-byte secret
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+### GitHub Actions secrets required
+
+| Secret | Used by |
+|--------|---------|
+| `CF_API_TOKEN` | wrangler deploy |
+| `CF_ACCOUNT_ID` | wrangler deploy |
+| `STAGING_SUPABASE_URL` | smoke tests |
+| `STAGING_SUPABASE_ANON_KEY` | smoke tests |
+| `STAGING_SUPABASE_SERVICE_ROLE_KEY` | supabase-verify |
+| `STAGING_GEMINI_API_KEY` | smoke tests |
+| `STAGING_TEST_USER_ID` | smoke tests |
+| `SLACK_WEBHOOK_URL` | notifications |
+| `SENTRY_AUTH_TOKEN` | Sentry release |
+| `SENTRY_ORG` | Sentry release |
+
 ---
 
-## 3. Deploy
+## Local Development
 
-### 3.1 Manual deploy to staging
+Run both the Worker and the Next.js frontend simultaneously:
+
+```bash
+# Terminal 1 — Worker (Miniflare / wrangler dev)
+cd workers/switchboard
+cp ../../.env.example .dev.vars   # create local secrets file
+# Edit .dev.vars — add your real keys (never commit this file)
+npx wrangler dev --env staging
+
+# Terminal 2 — Next.js frontend
+cd frontend
+npm run dev
+```
+
+The frontend dev proxy (`next.config.ts`) rewrites `/api/worker/*` → `http://localhost:8787/*` automatically. No frontend changes needed for local development.
+
+### .dev.vars format
+
+```env
+GEMINI_API_KEY=your-key-here
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+FOUNDRY_API_URL=https://your-foundry-instance.com
+FOUNDRY_API_KEY=your-foundry-key
+WORKER_HMAC_SECRET=your-32-byte-hex-secret
+ENVIRONMENT=development
+```
+
+> **Note:** `.dev.vars` is gitignored. Verify with `git check-ignore -v .dev.vars`.
+
+---
+
+## Deploy to Staging
+
+### Via CI (recommended)
+
+Push to `main` branch — the `worker-deploy.yml` workflow triggers automatically.
+
+### Manual deploy
 
 ```bash
 cd workers/switchboard
 npm run deploy:staging
-# Equivalent: wrangler deploy --env staging
+
+# Or via the blue/green script:
+cd ../..
+CF_API_TOKEN=<token> CF_ACCOUNT_ID=<id> bash deploy/bluegreen_deploy.sh staging
 ```
 
-### 3.2 Verify staging health
-
-```bash
-curl -s https://api-staging.sovereign.os/health | jq .
-# Expected: {"status":"healthy","checks":{...}}
-```
-
-### 3.3 Run smoke tests against staging
+### Verify staging
 
 ```bash
 WORKER_URL=https://api-staging.sovereign.os \
-SUPABASE_URL=$STAGING_SUPABASE_URL \
-SUPABASE_SERVICE_ROLE_KEY=$STAGING_SUPABASE_SERVICE_ROLE_KEY \
+TEST_USER_ID=<uuid> \
 node scripts/smoke-test.mjs
 ```
 
-### 3.4 Manual approval and production deploy
-
-After smoke tests pass:
-
-```bash
-npm run deploy:production
-# Equivalent: wrangler deploy --env production
-```
-
-**Or via CI:** The `worker-deploy.yml` workflow handles this automatically with a manual approval gate in the `production-gate` GitHub Environment.
-
 ---
 
-## 4. CI/CD Pipeline
+## Deploy to Production
 
-```
-push to main → [lint+typecheck] → [unit tests] → [deploy staging]
-             → [smoke tests staging] → [manual approval] → [deploy production]
-```
+Production requires:
+1. Staging smoke tests passing (automatic in CI)
+2. Manual approval in the `production-gate` GitHub Environment
 
-Configure the `production-gate` environment in **GitHub → Settings → Environments → production-gate** with required reviewers.
+### Via CI (recommended)
 
----
+1. Staging deploy succeeds
+2. Smoke tests pass
+3. A reviewer approves the `Approve Production Deploy` job in GitHub Actions
+4. Production deploy runs automatically
 
-## 5. Local Development
-
-### 5.1 Start both services concurrently
+### Manual deploy (emergency only)
 
 ```bash
-# Terminal 1 — Worker (port 8787)
+# Only use if CI is unavailable and the change is critical
 cd workers/switchboard
-cp .env.local.example .env.local  # populate secrets
-wrangler dev --env staging --local
+npm run deploy:production
 
-# Terminal 2 — Next.js frontend (port 3000)
-cd frontend
-vercel dev
+# Run smoke tests immediately after
+WORKER_URL=https://api.sovereign.os \
+TEST_USER_ID=<prod-test-uuid> \
+node scripts/smoke-test.mjs
 ```
-
-### 5.2 Configure local env
-
-Create `frontend/.env.local`:
-
-```env
-NEXT_PUBLIC_WORKER_URL=http://localhost:8787
-LOCAL_WORKER_URL=http://localhost:8787
-```
-
-Create `workers/switchboard/.dev.vars` (gitignored):
-
-```env
-GEMINI_API_KEY=your_key_here
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
-FOUNDRY_API_URL=https://your-foundry-instance.com
-FOUNDRY_API_KEY=your_foundry_key
-WEBHOOK_SECRET=dev-webhook-secret
-ENVIRONMENT=development
-```
-
-### 5.3 The proxy shim
-
-The file `frontend/pages/api/[...proxy].ts` transparently forwards all `/api/*` Next.js calls to the local Worker. This means existing frontend code that calls `/api/dispatch` continues to work locally without changes.
-
-**The proxy is disabled in production** (`NODE_ENV=production`). In production, the frontend calls `https://api.sovereign.os` directly via `worker-client.ts`.
 
 ---
 
-## 6. Rollback
+## Rollback
 
-### 6.1 Instant rollback via Wrangler
+### Instant rollback via Cloudflare Dashboard
 
-Wrangler keeps the last 10 deployments. To roll back:
+1. Go to **Workers & Pages** → `sovereign-switchboard-production`
+2. Click **Deployments** tab
+3. Find the last known-good deployment
+4. Click **…** → **Rollback to this deployment**
+
+### Rollback via CLI
 
 ```bash
 # List recent deployments
 wrangler deployments list --env production
 
-# Roll back to a specific deployment ID
+# Roll back to a specific deployment
 wrangler rollback <deployment-id> --env production
 ```
 
-### 6.2 Rollback via Git tag
+### Blue/green rollback (automated)
 
-Each production deploy creates a Git tag `worker-YYYY-MM-DD-<sha>`. To roll back:
-
-```bash
-git checkout <tag>
-cd workers/switchboard && npm run deploy:production
-```
-
-### 6.3 Emergency kill switch
-
-To take the Worker offline immediately:
+The `bluegreen_deploy.sh` script auto-rolls back staging if smoke tests fail:
 
 ```bash
-# Delete the production route (keeps the Worker deployed but unreachable)
-wrangler routes delete <route-id> --zone <zone-id>
-
-# Or disable via Cloudflare dashboard:
-# Workers & Pages → sovereign-switchboard-production → Settings → Disable
+CF_API_TOKEN=<token> CF_ACCOUNT_ID=<id> \
+STAGING_WORKER_URL=https://api-staging.sovereign.os \
+bash deploy/bluegreen_deploy.sh staging
+# Will auto-rollback staging on smoke test failure
 ```
 
----
+### Rollback time target
 
-## 7. Secret Rotation
-
-### Rotating GEMINI_API_KEY
-
-1. Generate a new key in Google AI Studio.
-2. `wrangler secret put GEMINI_API_KEY --env production` (enter new key when prompted).
-3. Cloudflare propagates new secrets within ~30 seconds — **zero downtime, no redeployment needed**.
-4. Revoke the old key in Google AI Studio.
-5. Verify health: `curl https://api.sovereign.os/health | jq .checks.ai`
-
-### Rotating SUPABASE_SERVICE_ROLE_KEY
-
-1. Generate a new service role key in Supabase Dashboard → Project Settings → API.
-2. `wrangler secret put SUPABASE_SERVICE_ROLE_KEY --env production`
-3. Revoke the old key in Supabase after confirming the new one works.
-
-### Rotating WEBHOOK_SECRET
-
-1. Generate a new secret: `openssl rand -hex 32`
-2. Update in Wrangler: `wrangler secret put WEBHOOK_SECRET --env production`
-3. Update the secret in the originating webhook provider.
+| Tier | Target |
+|------|--------|
+| Staging rollback | < 2 minutes |
+| Production rollback | < 5 minutes |
 
 ---
 
-## 8. Monitoring
+## Secret Rotation
 
-### Cloudflare Dashboard
+Secret rotation should be performed:
+- Every 90 days (scheduled)
+- Immediately upon suspected compromise
+- When an engineer with access leaves the team
 
-- **Workers & Pages → sovereign-switchboard-production → Metrics**: Requests, errors, CPU time, duration.
-- **Logs → Real-time Logs**: Live request logs (available on Paid plan).
+### Rotation procedure
 
-### Health endpoint monitoring
+```bash
+# 1. Generate new secret value
+NEW_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 
-Set up an uptime monitor (e.g., BetterUptime, Pingdom) on:
-- `https://api.sovereign.os/health` — expected status 200, `status: "healthy"`
+# 2. Deploy new secret to staging first
+echo "$NEW_SECRET" | wrangler secret put GEMINI_API_KEY --env staging
 
-### Scheduled smoke tests
+# 3. Verify staging still works
+node scripts/smoke-test.mjs
 
-The `worker-smoke-tests.yml` workflow runs daily at 06:00 UTC against staging. On failure, it auto-creates a GitHub issue labeled `smoke-test-failure`.
+# 4. Deploy to production
+echo "$NEW_SECRET" | wrangler secret put GEMINI_API_KEY --env production
+
+# 5. Update GitHub Actions secret (via GitHub UI or gh CLI)
+gh secret set STAGING_GEMINI_API_KEY --body "$NEW_SECRET"
+
+# 6. Verify production
+WORKER_URL=https://api.sovereign.os node scripts/smoke-test.mjs
+```
+
+### WORKER_HMAC_SECRET rotation (webhook break risk)
+
+Rotating `WORKER_HMAC_SECRET` will invalidate all in-flight webhook signatures. To rotate safely:
+
+1. Deploy new secret to staging, verify webhooks work
+2. Coordinate with Stripe webhook configuration — update the secret in Stripe dashboard
+3. Deploy to production during low-traffic window (e.g., 03:00 PDT)
+4. Monitor `/health` and Slack alerts for 15 minutes post-rotation
 
 ---
 
-## 9. Troubleshooting
+## Health Checks
 
-| Symptom | Likely Cause | Resolution |
-|---------|-------------|------------|
-| `/health` returns `status: "degraded"` | AI or DB connectivity issue | Check Gemini API quota; verify Supabase URL |
-| 422 on `/dispatch` | Schema validation failure | Check request body against `schemas.ts` |
-| 504 on simulator | Stream timeout exceeded | Reduce `max_tokens`; check Worker CPU limits |
-| 401 on `/webhook` | Signature mismatch | Verify `WEBHOOK_SECRET` matches sender |
-| CORS error in browser | Origin not in allowed list | Add origin to `ALLOWED_ORIGINS` in `index.ts` |
-| `wrangler dev` can't find bindings | `.dev.vars` missing | Create `workers/switchboard/.dev.vars` (see §5.2) |
+The `/health` endpoint provides a real-time status view:
+
+```bash
+# Staging
+curl -s https://api-staging.sovereign.os/health | jq .
+
+# Production
+curl -s https://api.sovereign.os/health | jq .
+```
+
+Expected response:
+
+```json
+{
+  "status": "healthy",
+  "version": "1.0.0",
+  "timestamp": "2026-05-09T17:00:00.000Z",
+  "checks": {
+    "supabase": "ok",
+    "ai": "ok",
+    "foundry": "ok"
+  },
+  "latency_ms": {
+    "ai": 342,
+    "db": 98,
+    "foundry": 201
+  }
+}
+```
+
+`status` values:
+- `healthy` — all checks pass → HTTP 200
+- `degraded` — some checks pass → HTTP 503 (still serving traffic)
+- `unhealthy` — all checks fail → HTTP 503
+
+---
+
+## Troubleshooting
+
+### Worker returns 500 on all routes
+
+1. Check Cloudflare Workers logs: **Dashboard → Workers → sovereign-switchboard → Logs**
+2. Verify all secrets are set: `wrangler secret list --env production`
+3. Check `/health` endpoint for failing subsystem
+
+### CORS rejections in browser
+
+Verify the request's `Origin` header matches an entry in `ALLOWED_ORIGINS` in `src/index.ts`. localhost:3000 and localhost:3001 are pre-allowed for dev.
+
+### Supabase 401 errors from Worker
+
+The `SUPABASE_SERVICE_ROLE_KEY` secret may be expired, truncated, or set incorrectly. Re-set it:
+
+```bash
+wrangler secret put SUPABASE_SERVICE_ROLE_KEY --env production
+```
+
+### Gemini API errors (429 rate limit)
+
+Gemini 1.5 Flash has generous limits but can be hit under load. The `ai_client.ts` does not retry on 429 (to avoid cascading). Options:
+- Implement request queuing in the Worker
+- Upgrade Gemini API tier
+- Add Worker KV caching for identical prompts
+
+### Wrangler deploy fails with "Script too large"
+
+Bundle size limit is 1 MB compressed. Run:
+
+```bash
+wrangler deploy --dry-run --outdir dist --env staging
+du -sh dist/
+```
+
+If over limit, audit `node_modules` for large transitive deps. The Vercel AI SDK is the main contributor.
+
+### Streaming responses cut off
+
+Cloudflare Workers have a 30-second CPU time limit per request. Streaming SSE responses can exceed wall-clock limits. The `stream_helpers.ts` enforces a 55-second timeout with a graceful `[DONE]` termination. If users report cut-off streams, check the `latency_ms.ai` field in `/health`.

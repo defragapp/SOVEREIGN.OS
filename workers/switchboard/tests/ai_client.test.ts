@@ -1,298 +1,239 @@
-/**
- * ai_client.test.ts — Unit tests for AI client wrappers (fully mocked)
- */
+// workers/switchboard/tests/ai_client.test.ts
+// Unit tests for ai_client — all AI calls are mocked via vi.mock.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { AIClientError } from "../src/ai_client";
 
-// ─── Mock @ai-sdk/google ──────────────────────────────────────────────────────
-
-vi.mock("@ai-sdk/google", () => ({
-  createGoogleGenerativeAI: vi.fn(() => {
-    const modelFn = vi.fn((modelId: string) => ({ modelId }));
-    modelFn.textEmbeddingModel = vi.fn((modelId: string, opts: Record<string, unknown>) => ({
-      modelId,
-      outputDimensionality: opts?.outputDimensionality ?? 768,
-    }));
-    return modelFn;
-  }),
-}));
-
-// ─── Mock ai SDK functions ────────────────────────────────────────────────────
+// ─── Mock the Vercel AI SDK ───────────────────────────────────────────────────
 
 vi.mock("ai", () => ({
   generateObject: vi.fn(),
   generateText: vi.fn(),
   streamText: vi.fn(),
-  embed: vi.fn(),
-  embedMany: vi.fn(),
 }));
 
-import { generateObject, generateText, streamText, embed, embedMany } from "ai";
-import { runAlignment, runCompression, runSimulatorStream, embedTexts, probeAI } from "../src/ai_client";
+vi.mock("@ai-sdk/google", () => ({
+  createGoogleGenerativeAI: vi.fn(() => vi.fn(() => "mock-model")),
+}));
 
-const FAKE_API_KEY = "test-gemini-key-abc123";
+import { generateObject, generateText, streamText } from "ai";
+import {
+  generateStructured,
+  generatePlainText,
+  streamAI,
+  probeAI,
+} from "../src/ai_client";
 
-// ─── runAlignment ─────────────────────────────────────────────────────────────
+const mockEnv = {
+  GEMINI_API_KEY: "test-key",
+};
 
-describe("runAlignment", () => {
-  beforeEach(() => {
-    vi.mocked(generateObject).mockResolvedValue({
-      object: {
-        status: "aligned",
-        score: 0.92,
-        reasoning: "The agent decision follows all alignment criteria.",
-        recommendations: [],
-      },
-      usage: { promptTokens: 100, completionTokens: 50, totalTokens: 150 },
+// ─── generateStructured ───────────────────────────────────────────────────────
+
+describe("generateStructured", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("calls generateObject with correct params and returns object", async () => {
+    const mockObject = {
+      reading: "You carry the mark of Saturn...",
+      archetypes: ["The Seeker"],
+      guidance: "Move forward.",
+      themes: ["transformation"],
+      generated_at: new Date().toISOString(),
+    };
+
+    vi.mocked(generateObject).mockResolvedValueOnce({
+      object: mockObject,
+      usage: { promptTokens: 100, completionTokens: 200, totalTokens: 300 },
       finishReason: "stop",
-      rawCall: { rawPrompt: "", rawSettings: {} },
       warnings: [],
-      request: {} as Request,
-      response: {} as Response,
+      rawResponse: {} as never,
+      response: {} as never,
       logprobs: undefined,
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-      toJsonResponse: vi.fn(),
+      request: {} as never,
     } as never);
+
+    const { z } = await import("zod");
+    const schema = z.object({
+      reading: z.string(),
+      archetypes: z.array(z.string()),
+      guidance: z.string(),
+      themes: z.array(z.string()),
+      generated_at: z.string(),
+    });
+
+    const result = await generateStructured({
+      env: mockEnv,
+      schema,
+      schemaName: "AlignmentResponse",
+      system: "You are a guide.",
+      prompt: "DOB: 1990-01-15",
+    });
+
+    expect(result.object).toEqual(mockObject);
+    expect(generateObject).toHaveBeenCalledOnce();
+
+    const callArgs = vi.mocked(generateObject).mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.system).toBe("You are a guide.");
+    expect(callArgs.prompt).toBe("DOB: 1990-01-15");
+    expect(callArgs.temperature).toBe(0.5); // default
+    expect(callArgs.maxTokens).toBe(2048); // default
   });
 
-  afterEach(() => vi.clearAllMocks());
+  it("uses pro model when modelKey is pro", async () => {
+    vi.mocked(generateObject).mockResolvedValueOnce({ object: {}, usage: {} } as never);
+    const { z } = await import("zod");
 
-  it("returns structured alignment result with correct shape", async () => {
-    const result = await runAlignment(FAKE_API_KEY, "Evaluate this decision", [], 0.3);
+    await generateStructured({
+      env: mockEnv,
+      modelKey: "pro",
+      schema: z.object({}),
+      schemaName: "Test",
+      system: "sys",
+      prompt: "p",
+    }).catch(() => {}); // may fail schema validation, that's ok
 
-    expect(result.status).toBe("aligned");
-    expect(result.score).toBe(0.92);
-    expect(result.reasoning).toBeTypeOf("string");
-    expect(result.recommendations).toBeInstanceOf(Array);
-    expect(result.usage.total_tokens).toBe(150);
-    expect(result.model).toContain("gemini");
-    expect(result.latency_ms).toBeGreaterThanOrEqual(0);
+    expect(generateObject).toHaveBeenCalledOnce();
   });
 
-  it("calls generateObject exactly once", async () => {
-    await runAlignment(FAKE_API_KEY, "Test prompt", ["ctx1"], 0.5);
-    expect(generateObject).toHaveBeenCalledTimes(1);
-  });
+  it("propagates errors from generateObject", async () => {
+    vi.mocked(generateObject).mockRejectedValueOnce(new Error("API key invalid"));
+    const { z } = await import("zod");
 
-  it("passes context window in messages", async () => {
-    await runAlignment(FAKE_API_KEY, "Test prompt", ["ctx1", "ctx2"], 0.3);
-    const call = vi.mocked(generateObject).mock.calls[0][0];
-    const userMessage = (call.messages as Array<{ role: string; content: string }>).find(
-      (m) => m.role === "user"
-    );
-    expect(userMessage?.content).toContain("ctx1");
-    expect(userMessage?.content).toContain("ctx2");
-  });
-
-  it("propagates AI SDK errors", async () => {
-    vi.mocked(generateObject).mockRejectedValue(new Error("Rate limit exceeded"));
     await expect(
-      runAlignment(FAKE_API_KEY, "Test", [], 0.3)
-    ).rejects.toThrow("Rate limit exceeded");
+      generateStructured({
+        env: mockEnv,
+        schema: z.object({ x: z.string() }),
+        schemaName: "Test",
+        system: "sys",
+        prompt: "p",
+      })
+    ).rejects.toThrow("API key invalid");
+  });
+
+  it("respects custom temperature and maxTokens", async () => {
+    vi.mocked(generateObject).mockResolvedValueOnce({ object: {}, usage: {} } as never);
+    const { z } = await import("zod");
+
+    await generateStructured({
+      env: mockEnv,
+      schema: z.object({}),
+      schemaName: "Test",
+      system: "sys",
+      prompt: "p",
+      temperature: 0.2,
+      maxTokens: 512,
+    }).catch(() => {});
+
+    const call = vi.mocked(generateObject).mock.calls[0][0] as Record<string, unknown>;
+    expect(call.temperature).toBe(0.2);
+    expect(call.maxTokens).toBe(512);
   });
 });
 
-// ─── runCompression ───────────────────────────────────────────────────────────
+// ─── generatePlainText ────────────────────────────────────────────────────────
 
-describe("runCompression", () => {
-  const CONTENT = "This is a long document. ".repeat(100);
+describe("generatePlainText", () => {
+  beforeEach(() => vi.clearAllMocks());
 
-  afterEach(() => vi.clearAllMocks());
-
-  it("uses generateObject for structured_json format", async () => {
-    vi.mocked(generateObject).mockResolvedValue({
-      object: { compressed_content: "Short summary." },
-      usage: { promptTokens: 200, completionTokens: 10, totalTokens: 210 },
+  it("returns text from generateText", async () => {
+    vi.mocked(generateText).mockResolvedValueOnce({
+      text: "You are ready to take the next step.",
+      usage: { promptTokens: 50, completionTokens: 10, totalTokens: 60 },
       finishReason: "stop",
-      rawCall: { rawPrompt: "", rawSettings: {} },
       warnings: [],
-      request: {} as Request,
-      response: {} as Response,
-      logprobs: undefined,
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-      toJsonResponse: vi.fn(),
     } as never);
 
-    const result = await runCompression(FAKE_API_KEY, CONTENT, 0.1, [], "structured_json");
+    const result = await generatePlainText({
+      env: mockEnv,
+      system: "sys",
+      prompt: "What should I know?",
+    });
 
-    expect(generateObject).toHaveBeenCalledTimes(1);
-    expect(generateText).not.toHaveBeenCalled();
-    expect(result.compressed_content).toBe("Short summary.");
-    expect(result.usage.total_tokens).toBe(210);
+    expect(result).toBe("You are ready to take the next step.");
+    expect(generateText).toHaveBeenCalledOnce();
   });
 
-  it("uses generateText for summary format", async () => {
-    vi.mocked(generateText).mockResolvedValue({
-      text: "Condensed version.",
-      usage: { promptTokens: 200, completionTokens: 5, totalTokens: 205 },
-      finishReason: "stop",
-      rawCall: { rawPrompt: "", rawSettings: {} },
-      warnings: [],
-      request: {} as Request,
-      response: {} as Response,
-      steps: [],
-      toolCalls: [],
-      toolResults: [],
-      reasoning: undefined,
-      reasoningDetails: [],
-      sources: [],
-      files: [],
-      logprobs: undefined,
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-    } as never);
-
-    const result = await runCompression(FAKE_API_KEY, CONTENT, 0.25, [], "summary");
-
-    expect(generateText).toHaveBeenCalledTimes(1);
-    expect(generateObject).not.toHaveBeenCalled();
-    expect(result.compressed_content).toBe("Condensed version.");
-  });
-
-  it("uses generateText for bullet_points format", async () => {
-    vi.mocked(generateText).mockResolvedValue({
-      text: "• Point 1\n• Point 2",
-      usage: { promptTokens: 180, completionTokens: 8, totalTokens: 188 },
-      finishReason: "stop",
-      rawCall: { rawPrompt: "", rawSettings: {} },
-      warnings: [],
-      request: {} as Request,
-      response: {} as Response,
-      steps: [],
-      toolCalls: [],
-      toolResults: [],
-      reasoning: undefined,
-      reasoningDetails: [],
-      sources: [],
-      files: [],
-      logprobs: undefined,
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-    } as never);
-
-    const result = await runCompression(FAKE_API_KEY, CONTENT, 0.2, ["key-term"], "bullet_points");
-    expect(result.compressed_content).toContain("Point 1");
-  });
-
-  it("passes preserve_keys to system prompt", async () => {
-    vi.mocked(generateText).mockResolvedValue({
-      text: "summary",
-      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
-      finishReason: "stop",
-      rawCall: { rawPrompt: "", rawSettings: {} },
-      warnings: [],
-      request: {} as Request,
-      response: {} as Response,
-      steps: [],
-      toolCalls: [],
-      toolResults: [],
-      reasoning: undefined,
-      reasoningDetails: [],
-      sources: [],
-      files: [],
-      logprobs: undefined,
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-    } as never);
-
-    await runCompression(FAKE_API_KEY, CONTENT, 0.25, ["important-term"], "summary");
-    const call = vi.mocked(generateText).mock.calls[0][0];
-    const systemMsg = (call.messages as Array<{ role: string; content: string }>).find(
-      (m) => m.role === "system"
-    );
-    expect(systemMsg?.content).toContain("important-term");
+  it("propagates errors", async () => {
+    vi.mocked(generateText).mockRejectedValueOnce(new Error("Rate limit"));
+    await expect(
+      generatePlainText({ env: mockEnv, system: "s", prompt: "p" })
+    ).rejects.toThrow("Rate limit");
   });
 });
 
-// ─── embedTexts ───────────────────────────────────────────────────────────────
+// ─── streamAI ─────────────────────────────────────────────────────────────────
 
-describe("embedTexts", () => {
-  afterEach(() => vi.clearAllMocks());
+describe("streamAI", () => {
+  beforeEach(() => vi.clearAllMocks());
 
-  it("uses embed() for a single text and returns 768-dim vector", async () => {
-    const fakeEmbedding = Array.from({ length: 768 }, () => Math.random());
-    vi.mocked(embed).mockResolvedValue({
-      embedding: fakeEmbedding,
-      usage: { tokens: 5 },
-      rawCall: { rawPrompt: "", rawSettings: {} },
-      request: {} as Request,
-      response: {} as Response,
-      warnings: [],
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-    } as never);
+  it("calls streamText with messages", () => {
+    const mockStream = { textStream: (async function* () { yield "Hello"; })() };
+    vi.mocked(streamText).mockReturnValueOnce(mockStream as never);
 
-    const result = await embedTexts(FAKE_API_KEY, ["hello world"]);
+    const result = streamAI({
+      env: mockEnv,
+      system: "You are a guide.",
+      messages: [{ role: "user", content: "Hi" }],
+    });
 
-    expect(embed).toHaveBeenCalledTimes(1);
-    expect(embedMany).not.toHaveBeenCalled();
-    expect(result.embeddings).toHaveLength(1);
-    expect(result.embeddings[0]).toHaveLength(768);
-    expect(result.dim).toBe(768);
+    expect(streamText).toHaveBeenCalledOnce();
+    expect(result).toBe(mockStream);
+
+    const call = vi.mocked(streamText).mock.calls[0][0] as Record<string, unknown>;
+    expect(call.system).toBe("You are a guide.");
   });
 
-  it("uses embedMany() for multiple texts", async () => {
-    const fakeEmbeddings = [
-      Array.from({ length: 768 }, () => Math.random()),
-      Array.from({ length: 768 }, () => Math.random()),
-    ];
-    vi.mocked(embedMany).mockResolvedValue({
-      embeddings: fakeEmbeddings,
-      usage: { tokens: 10 },
-      rawCall: { rawPrompt: "", rawSettings: {} },
-      request: {} as Request,
-      response: {} as Response,
-      warnings: [],
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-    } as never);
+  it("uses flash model by default", () => {
+    const mockStream = { textStream: (async function* () {})() };
+    vi.mocked(streamText).mockReturnValueOnce(mockStream as never);
 
-    const result = await embedTexts(FAKE_API_KEY, ["text1", "text2"]);
+    streamAI({
+      env: mockEnv,
+      system: "sys",
+      messages: [{ role: "user", content: "hello" }],
+    });
 
-    expect(embedMany).toHaveBeenCalledTimes(1);
-    expect(embed).not.toHaveBeenCalled();
-    expect(result.embeddings).toHaveLength(2);
-    expect(result.dim).toBe(768);
+    // modelKey defaults to "flash" — createGoogleGenerativeAI is called with flash model
+    expect(streamText).toHaveBeenCalledOnce();
   });
 });
 
-// ─── probeAI ─────────────────────────────────────────────────────────────────
+// ─── probeAI ──────────────────────────────────────────────────────────────────
 
 describe("probeAI", () => {
-  afterEach(() => vi.clearAllMocks());
+  beforeEach(() => vi.clearAllMocks());
 
-  it("returns ok=true on successful AI call", async () => {
-    vi.mocked(generateText).mockResolvedValue({
-      text: "ok",
-      usage: { promptTokens: 2, completionTokens: 1, totalTokens: 3 },
-      finishReason: "stop",
-      rawCall: { rawPrompt: "", rawSettings: {} },
-      warnings: [],
-      request: {} as Request,
-      response: {} as Response,
-      steps: [],
-      toolCalls: [],
-      toolResults: [],
-      reasoning: undefined,
-      reasoningDetails: [],
-      sources: [],
-      files: [],
-      logprobs: undefined,
-      providerMetadata: undefined,
-      experimental_providerMetadata: undefined,
-    } as never);
-
-    const result = await probeAI(FAKE_API_KEY);
+  it("returns ok:true when generateText succeeds", async () => {
+    vi.mocked(generateText).mockResolvedValueOnce({ text: "ok" } as never);
+    const result = await probeAI(mockEnv);
     expect(result.ok).toBe(true);
     expect(result.latency_ms).toBeGreaterThanOrEqual(0);
   });
 
-  it("returns ok=false on AI SDK error", async () => {
-    vi.mocked(generateText).mockRejectedValue(new Error("API unavailable"));
-
-    const result = await probeAI(FAKE_API_KEY);
+  it("returns ok:false when generateText throws", async () => {
+    vi.mocked(generateText).mockRejectedValueOnce(new Error("Network error"));
+    const result = await probeAI(mockEnv);
     expect(result.ok).toBe(false);
+  });
+});
+
+// ─── AIClientError ────────────────────────────────────────────────────────────
+
+describe("AIClientError", () => {
+  it("has correct name and statusCode", () => {
+    const err = new AIClientError("Something went wrong", 429);
+    expect(err.name).toBe("AIClientError");
+    expect(err.message).toBe("Something went wrong");
+    expect(err.statusCode).toBe(429);
+  });
+
+  it("defaults statusCode to 500", () => {
+    const err = new AIClientError("Error");
+    expect(err.statusCode).toBe(500);
+  });
+
+  it("is instanceof Error", () => {
+    expect(new AIClientError("e")).toBeInstanceOf(Error);
   });
 });

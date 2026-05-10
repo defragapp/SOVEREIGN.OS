@@ -1,124 +1,148 @@
-/**
- * useSimulator.ts
- * React hook for the streaming Loop Simulator.
- * Replaces /api/simulator — calls the Worker's /dispatch simulator operation.
- */
+// frontend/src/hooks/useSimulator.ts
+// Hook for The Loop — streaming agent conversations via Worker SSE.
 
 import { useState, useCallback, useRef } from "react";
-import { dispatchStream, WorkerUnavailableError } from "../lib/worker-client";
-import { nanoid } from "nanoid";
+import { workerStream, friendlyError, type WorkerError } from "@lib/worker-client";
 
 export interface SimulatorMessage {
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant";
   content: string;
+  created_at: string;
 }
 
-export type SimulatorState =
-  | { status: "idle" }
-  | { status: "streaming"; content: string; tokenCount: number }
-  | { status: "success"; content: string; tokenCount: number }
-  | { status: "queued"; queueId: string; message: string }
-  | { status: "error"; code: string; message: string; retryable: boolean };
+export type SimulatorStatus =
+  | "idle"
+  | "streaming"
+  | "success"
+  | "error"
+  | "rate_limited";
 
 export interface UseSimulatorReturn {
-  state: SimulatorState;
-  simulate: (opts: {
-    session_id: string;
-    agent_id: string;
-    loop_id?: string;
-    messages: SimulatorMessage[];
-    max_tokens?: number;
-    temperature?: number;
+  status: SimulatorStatus;
+  messages: SimulatorMessage[];
+  streamingContent: string;
+  errorMessage: string | null;
+  conversationId: string | null;
+  send: (opts: {
+    agentId: string;
+    message: string;
+    userId: string;
+    conversationId?: string;
   }) => Promise<void>;
   reset: () => void;
-  cancel: () => void;
 }
 
 export function useSimulator(): UseSimulatorReturn {
-  const [state, setState] = useState<SimulatorState>({ status: "idle" });
+  const [status, setStatus] = useState<SimulatorStatus>("idle");
+  const [messages, setMessages] = useState<SimulatorMessage[]>([]);
+  const [streamingContent, setStreamingContent] = useState("");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const cancel = useCallback(() => {
-    abortRef.current?.abort();
-    setState({ status: "idle" });
-  }, []);
+  const send = useCallback(
+    async (opts: {
+      agentId: string;
+      message: string;
+      userId: string;
+      conversationId?: string;
+    }) => {
+      const { agentId, message, userId, conversationId: existingConvId } = opts;
 
-  const reset = useCallback(() => setState({ status: "idle" }), []);
+      // Cancel any in-flight stream
+      abortRef.current?.abort();
+      abortRef.current = new AbortController();
 
-  const simulate = useCallback(async (opts: {
-    session_id: string;
-    agent_id: string;
-    loop_id?: string;
-    messages: SimulatorMessage[];
-    max_tokens?: number;
-    temperature?: number;
-  }) => {
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
+      // Append user message immediately (optimistic)
+      const userMessage: SimulatorMessage = {
+        role: "user",
+        content: message,
+        created_at: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+      setStreamingContent("");
+      setErrorMessage(null);
+      setStatus("streaming");
 
-    setState({ status: "streaming", content: "", tokenCount: 0 });
+      let assembled = "";
 
-    let accumulated = "";
-    let totalTokens = 0;
-
-    try {
-      for await (const event of dispatchStream({
-        operation: "simulator",
-        payload: {
-          ...opts,
-          max_tokens: opts.max_tokens ?? 2048,
-          temperature: opts.temperature ?? 0.7,
-        } as unknown as Record<string, unknown>,
-        idempotencyKey: nanoid(),
-        signal: controller.signal,
-      })) {
-        if (controller.signal.aborted) break;
-
-        if (event.type === "delta") {
-          const data = event.data as { delta?: string };
-          accumulated += data.delta ?? "";
-          setState({ status: "streaming", content: accumulated, tokenCount: totalTokens });
-        } else if (event.type === "usage") {
-          const data = event.data as { total_tokens?: number };
-          totalTokens = data.total_tokens ?? totalTokens;
-        } else if (event.type === "error") {
-          const data = event.data as { message?: string };
-          setState({
-            status: "error",
-            code: "STREAM_ERROR",
-            message: data.message ?? "Stream error occurred",
-            retryable: true,
-          });
-          return;
-        } else if (event.type === "done") {
-          break;
+      try {
+        await workerStream(
+          {
+            space: "the_loop",
+            userId,
+            payload: {
+              agent_id: agentId,
+              message,
+              ...(existingConvId ? { conversation_id: existingConvId } : {}),
+              stream: true,
+            },
+            signal: abortRef.current.signal,
+          },
+          {
+            onChunk: (text) => {
+              assembled += text;
+              setStreamingContent(assembled);
+            },
+            onDone: () => {
+              if (assembled) {
+                const assistantMessage: SimulatorMessage = {
+                  role: "assistant",
+                  content: assembled,
+                  created_at: new Date().toISOString(),
+                };
+                setMessages((prev) => [...prev, assistantMessage]);
+              }
+              setStreamingContent("");
+              setStatus("success");
+            },
+            onError: (err) => {
+              setStreamingContent("");
+              setErrorMessage(
+                err === "stream_timeout"
+                  ? "The response took too long. Please try again."
+                  : "Something went wrong. Please try again."
+              );
+              setStatus("error");
+            },
+          }
+        );
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          // User cancelled — preserve partial content if any
+          if (assembled) {
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: assembled + "…", created_at: new Date().toISOString() },
+            ]);
+          }
+          setStreamingContent("");
+          setStatus("idle");
+        } else {
+          setErrorMessage("We couldn't reach the server. Check your connection and try again.");
+          setStatus("error");
         }
       }
+    },
+    []
+  );
 
-      if (!controller.signal.aborted) {
-        setState({ status: "success", content: accumulated, tokenCount: totalTokens });
-      }
-    } catch (err) {
-      if (controller.signal.aborted) return;
-
-      if (err instanceof WorkerUnavailableError) {
-        setState({
-          status: "queued",
-          queueId: err.requestId,
-          message: "The simulator is temporarily unavailable. Your session has been queued.",
-        });
-        return;
-      }
-
-      setState({
-        status: "error",
-        code: "STREAM_ERROR",
-        message: err instanceof Error ? err.message : "Simulator failed",
-        retryable: true,
-      });
-    }
+  const reset = useCallback(() => {
+    abortRef.current?.abort();
+    setStatus("idle");
+    setMessages([]);
+    setStreamingContent("");
+    setErrorMessage(null);
+    setConversationId(null);
   }, []);
 
-  return { state, simulate, reset, cancel };
+  return {
+    status,
+    messages,
+    streamingContent,
+    errorMessage,
+    conversationId,
+    send,
+    reset,
+  };
 }

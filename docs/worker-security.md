@@ -1,288 +1,332 @@
-# Sovereign AI Switchboard — Security & Operations Guide
+# Worker Security Guide — Sovereign AI Switchboard
 
-> **Last updated:** 2026-05-09  
-> **Worker:** `sovereign-switchboard` · `api.sovereign.os`
-
----
-
-## 1. Content Security Policy (CSP)
-
-The Worker is a JSON/SSE API — it does not serve HTML. CSP headers are not required for the Worker itself. However, the **frontend** that calls the Worker must include:
-
-```http
-Content-Security-Policy:
-  default-src 'self';
-  connect-src 'self' https://api.sovereign.os https://api-staging.sovereign.os;
-  script-src 'self' 'nonce-{NONCE}';
-  style-src 'self' 'nonce-{NONCE}';
-  img-src 'self' data: https:;
-  frame-ancestors 'none';
-  form-action 'self';
-  upgrade-insecure-requests;
-```
-
-The Worker sets the following security headers on every response via Hono's `secureHeaders()` middleware:
-
-| Header | Value |
-|--------|-------|
-| `X-Content-Type-Options` | `nosniff` |
-| `X-Frame-Options` | `DENY` |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` |
-| `Permissions-Policy` | `geolocation=(), microphone=(), camera=()` |
-| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` |
+> **Audience:** Engineers, security reviewers, and ops team.
+> **Last updated:** 2026-05-09
 
 ---
 
-## 2. CORS Policy
+## Table of Contents
 
-The Worker enforces a strict allowlist of origins. The allowlist is defined in `workers/switchboard/src/index.ts`:
+1. [Threat Model](#threat-model)
+2. [CORS Policy](#cors-policy)
+3. [Authentication & Authorization](#authentication--authorization)
+4. [Rate Limiting](#rate-limiting)
+5. [Idempotency](#idempotency)
+6. [Request Size Limits](#request-size-limits)
+7. [Secrets Management](#secrets-management)
+8. [Webhook Security](#webhook-security)
+9. [PII Handling](#pii-handling)
+10. [Content Security Policy](#content-security-policy)
+11. [Dependency Security](#dependency-security)
+12. [Incident Response](#incident-response)
+
+---
+
+## Threat Model
+
+| Threat | Mitigation |
+|--------|-----------|
+| Cross-origin request forgery | CORS allowlist; credentials: include |
+| Replay attacks (webhooks) | HMAC-SHA256 + idempotency key deduplication |
+| Prompt injection via user input | Input length limits; Zod validation; system prompt anchoring |
+| Secret exfiltration | Secrets via `wrangler secret put` only; never in env vars, code, or logs |
+| Credit/rate-limit bypass | Server-side rate check against Supabase `agent_runs` |
+| Pro-gate bypass | Server-side tier check against `profiles.tier` via service role key |
+| Oversized payload attack | 256 KB hard limit on all `/dispatch` requests |
+| Streaming resource exhaustion | 55-second SSE timeout; CPU time limit via `wrangler.toml` |
+| Supply chain attacks | Lockfile committed; npm audit in CI |
+
+---
+
+## CORS Policy
+
+### Allowed origins
 
 ```typescript
 const ALLOWED_ORIGINS = [
   "https://sovereign.os",
   "https://www.sovereign.os",
-  "https://app.sovereign.os",
-  /^https:\/\/sovereign.*\.vercel\.app$/,   // Vercel preview URLs
+  "https://staging.sovereign.os",
+  "http://localhost:3000",
+  "http://localhost:3001",
 ];
 ```
 
-**Rules:**
-- Requests from non-listed origins receive an empty `Access-Control-Allow-Origin` header.
-- Preflight `OPTIONS` requests return `204 No Content` within ~1 ms (no AI calls made).
-- Credentials (`withCredentials`) are **not** supported — the Worker uses API key authentication at the edge, not cookies.
-- To add a new origin: update `ALLOWED_ORIGINS` and deploy. No secrets change needed.
+- Any request from an origin not in this list receives **no** `Access-Control-Allow-Origin` header, causing the browser to block it.
+- The `credentials: include` flag is set on all frontend fetch calls, enabling cookie-based session sharing between `sovereign.os` and `api.sovereign.os`.
+- Preflight (`OPTIONS`) requests are cached for 86,400 seconds (1 day) to reduce latency.
 
-**Never add wildcard `*` to the production allowlist.**
+### Adding a new origin
 
----
-
-## 3. Rate Limiting
-
-### 3.1 Cloudflare-level rate limiting (recommended)
-
-Configure in the Cloudflare dashboard under **Security → WAF → Rate Limiting Rules**:
-
-| Rule | Path | Limit | Period | Action |
-|------|------|-------|--------|--------|
-| Dispatch global | `/dispatch` | 100 req | 60 s per IP | Block (429) |
-| Dispatch per session | `/dispatch` | 20 req | 60 s per header `X-Session-Id` | Block (429) |
-| Webhook | `/webhook` | 500 req | 60 s per IP | Block (429) |
-| Health probe | `/health` | 60 req | 60 s per IP | Block (429) |
-
-### 3.2 Application-level request size limits
-
-Enforced in `stream_helpers.ts → readBodyWithLimit()`:
-
-| Endpoint | Max body size |
-|----------|--------------|
-| `/dispatch` (alignment, compression) | 512 KB |
-| `/dispatch` (simulator) | 512 KB |
-| `/dispatch` (embed) | 256 KB |
-| `/webhook` | 128 KB |
-
-### 3.3 Streaming timeouts
-
-Enforced in `stream_helpers.ts → withStreamTimeout()`:
-
-| Stream type | Timeout |
-|-------------|---------|
-| Alignment stream | 25 s |
-| Simulator stream | 25 s |
-
-Cloudflare Workers have a hard 30 s CPU time limit on the Paid plan. The 25 s application timeout provides a 5 s safety margin for cleanup.
+1. Add the origin to `ALLOWED_ORIGINS` in `workers/switchboard/src/index.ts`
+2. Deploy to staging and verify with: `curl -I -X OPTIONS https://api-staging.sovereign.os/dispatch -H "Origin: https://new-origin.com"`
+3. Confirm `Access-Control-Allow-Origin: https://new-origin.com` appears in the response headers
 
 ---
 
-## 4. Idempotency
+## Authentication & Authorization
 
-### 4.1 `/dispatch`
+### User identity
 
-- Clients SHOULD send an `X-Idempotency-Key` header (UUID or nanoid).
-- If the same key is received twice within 60 seconds, the Worker returns the cached response (if implemented via Cloudflare KV — not yet wired).
-- Current implementation: idempotency keys are persisted to `webhook_events.idempotency_key` in Supabase with `ON CONFLICT DO NOTHING`.
+The Worker does **not** issue or verify JWT tokens directly. User identity is passed via the `user_id` field in the dispatch envelope. The NextAuth session on the frontend ensures only authenticated users reach the Worker.
 
-### 4.2 `/webhook`
+**Recommended enhancement:** Add JWT verification middleware to the Worker:
 
-- Every webhook payload MUST include `idempotency_key`.
-- The Worker inserts the key into `webhook_events` with `ON CONFLICT (idempotency_key) DO NOTHING`.
-- Duplicate events are silently accepted (HTTP 200) without re-processing.
-- Keys are never deleted — this guarantees exactly-once semantics for the lifetime of the project.
+```typescript
+// Recommended future addition to index.ts middleware
+app.use("/dispatch", async (c, next) => {
+  const token = c.req.header("Authorization")?.replace("Bearer ", "");
+  if (!token) return c.json({ error: "Unauthorized", code: "UNAUTHORIZED" }, 401);
+  // Verify against SUPABASE_JWT_SECRET
+  // ...
+  return next();
+});
+```
 
-**Implementation checklist for new webhook handlers:**
-1. ✅ Extract `idempotency_key` from payload.
-2. ✅ Attempt INSERT with `ignoreDuplicates: true`.
-3. ✅ Check INSERT result — if 0 rows inserted, the event is a duplicate; return 200 without processing.
-4. ✅ Process event.
-5. ✅ Return 200.
+### Pro tier gate
 
----
+All requests to `compression` and `covenant` spaces check `profiles.tier = 'pro'` via Supabase PostgREST using the service role key. Downgrades are enforced immediately — no client-side caching of tier status.
 
-## 5. PII Handling
+### Rate limiting
 
-### 5.1 Data classification
-
-| Field | Classification | Notes |
-|-------|---------------|-------|
-| `session_id` | Pseudonymous identifier | UUID — not directly linkable to a user |
-| `agent_id` | System identifier | Not PII |
-| `prompt` content | Potentially sensitive | May contain user data; treat as confidential |
-| `compressed_content` | Potentially sensitive | Same as prompt |
-| Loop messages | Potentially sensitive | Stored in `loop_messages`; encrypted at rest via Supabase |
-| Embeddings | Derived / non-reversible | 768-dim vectors — not directly PII |
-| IP addresses | PII in some jurisdictions | Cloudflare logs IPs; configure log retention per GDPR/CCPA |
-
-### 5.2 Data minimisation rules
-
-- The Worker **never logs** prompt content, compressed content, or message bodies.
-- The Worker logs: `operation`, `session_id`, `agent_id`, `status`, `latency_ms`, `token_usage`.
-- `input_summary` and `output_summary` stored in `agent_runs` are limited to 256 characters.
-- PII in prompts must be redacted by the caller before sending to the Worker.
-
-### 5.3 Data retention
-
-| Table | Retention | Cleanup |
-|-------|-----------|---------|
-| `agent_runs` | 90 days | Supabase scheduled deletion job |
-| `loop_messages` | 30 days | Supabase scheduled deletion job |
-| `webhook_events` | 365 days (idempotency) | Manual archival |
-| `baseline_designs` | Indefinite (versioned) | Manual |
-
-### 5.4 Cross-border data transfer
-
-- Google Gemini API: data processed in Google infrastructure. Review Google's data processing addendum for GDPR compliance.
-- Cloudflare Workers: edge compute. Enable **Regional Services** in the Cloudflare dashboard to restrict processing to specific regions if required.
-- Supabase: ensure the project region matches your data residency requirements.
+Server-side only. Rate limits are enforced by counting `agent_runs` rows for the user within the rolling window. Clients cannot override or bypass this.
 
 ---
 
-## 6. Authentication & Authorisation
+## Rate Limiting
 
-### 6.1 Worker-to-Supabase
+| Space | Window | Max | Tier |
+|-------|--------|-----|------|
+| Launcher | — | Unlimited | Free |
+| Defrag | 24 hours | 3 | Free |
+| Alignment | 24 hours | 5 | Free |
+| The Loop | 24 hours | 3 | Free |
+| Compression | — | Unlimited | Pro |
+| Covenant | — | Unlimited | Pro |
 
-- Uses `SUPABASE_SERVICE_ROLE_KEY` for all DB writes.
-- The service role key bypasses Row-Level Security (RLS) — **do not expose this key to the frontend**.
-- For read-heavy paths where RLS is acceptable, use `anonKey` (passed as `useServiceRole: false` in `supabase_client.ts`).
-
-### 6.2 Worker-to-Foundry
-
-- Uses `FOUNDRY_API_KEY` via `Authorization: Bearer` header.
-- Circuit breaker trips after 5 consecutive failures; resets after 30 s.
-
-### 6.3 Webhook signature verification
-
-- Webhooks from trusted senders must include `X-Sovereign-Signature: sha256=<hmac>`.
-- The HMAC is computed over the raw request body using `WEBHOOK_SECRET` as the key (SHA-256).
-- Verification is performed using `crypto.subtle.verify` (constant-time) to prevent timing attacks.
-- Unsigned webhooks are still accepted if `WEBHOOK_SECRET` is not set (development mode). **Always set `WEBHOOK_SECRET` in production.**
-
-### 6.4 Frontend authentication
-
-- The frontend uses Supabase Auth (JWTs) for user authentication.
-- The Worker does not validate user JWTs — it trusts the frontend to gate access.
-- For multi-tenant isolation, pass `session_id` as a stable per-user/per-session UUID. Never use user IDs directly as session IDs.
+- Rate limit state lives in `agent_runs` (Supabase). No KV store or Durable Objects required.
+- On rate limit hit: HTTP 429 with `X-RateLimit-Remaining: 0` and a user-friendly message.
+- **Fail open:** If the Supabase rate check errors, the request is allowed (avoids blocking legitimate users due to DB latency spikes).
 
 ---
 
-## 7. Secrets Management
+## Idempotency
 
-### 7.1 Where secrets live
+The `/dispatch` route supports an optional `X-Idempotency-Key` header and `idempotency_key` body field.
 
-| Secret | Storage | Access |
-|--------|---------|--------|
-| `GEMINI_API_KEY` | Cloudflare Workers Secrets | Worker runtime only |
-| `SUPABASE_*` | Cloudflare Workers Secrets | Worker runtime only |
-| `FOUNDRY_*` | Cloudflare Workers Secrets | Worker runtime only |
-| `WEBHOOK_SECRET` | Cloudflare Workers Secrets | Worker runtime only |
-| `CLOUDFLARE_API_TOKEN` | GitHub Actions Secrets | CI/CD only |
+### Behaviour
 
-### 7.2 What is never stored in the repository
+1. On first request: execute normally, log to `agent_runs` with the idempotency key.
+2. On duplicate request (same `user_id` + `idempotency_key`): return HTTP 200 `{ cached: true }` immediately — no AI call.
 
-- No `.env` files with real values.
-- No `wrangler.toml` `[vars]` with secret values.
-- No hardcoded API keys anywhere in source code.
-- `workers/switchboard/.dev.vars` is gitignored.
+### Webhook idempotency
 
-### 7.3 Secret scanning
+Stripe webhooks include an `idempotency_key` field. The `/webhook` handler processes each event exactly once. Re-sent webhooks return 200 without re-processing.
 
-Configure GitHub Secret Scanning (free for public repos, available on Enterprise):
-- **Settings → Code security → Secret scanning → Enable**.
-- Add a custom pattern for `SUPABASE_SERVICE_ROLE_KEY` format: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`.
+### Generating idempotency keys (frontend)
+
+```typescript
+import { nanoid } from "nanoid";
+const key = `alignment-${nanoid()}`;
+```
 
 ---
 
-## 8. Dependency Security
+## Request Size Limits
+
+| Limit | Value |
+|-------|-------|
+| Max body size (dispatch) | 256 KB |
+| Max content field (compression) | 40,000 characters |
+| Max question field (alignment) | 1,200 characters |
+| Max entries (defrag) | 50 entries × 4,000 chars each |
+| Max message (the_loop) | 8,000 characters |
+| Max streaming timeout | 55 seconds |
+| Cloudflare CPU limit | 50ms per request (configured in wrangler.toml) |
+
+Oversized requests receive HTTP 413 immediately, before any AI call is made.
+
+---
+
+## Secrets Management
+
+### What is secret
+
+| Secret | Description | Rotation cadence |
+|--------|-------------|-----------------|
+| `GEMINI_API_KEY` | Google AI Studio API key | 90 days |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase admin key (bypasses RLS) | 90 days |
+| `FOUNDRY_API_KEY` | Foundry agent API key | 90 days |
+| `WORKER_HMAC_SECRET` | HMAC key for webhook verification | 90 days or on compromise |
+| `SENTRY_DSN` | Error reporting endpoint | On Sentry project change |
+| `DATADOG_API_KEY` | Metrics API key | 90 days |
+
+### What is NOT secret (safe to expose)
+
+- `SUPABASE_URL` — PostgREST base URL (public)
+- `ENVIRONMENT` — "staging" / "production"
+- `NEXT_PUBLIC_WORKER_URL` — public Worker URL
+
+### Secret handling rules
+
+1. Never log secrets — no `console.log(env.GEMINI_API_KEY)`
+2. Never echo secrets in responses
+3. Never include secrets in error messages
+4. Never store secrets in `wrangler.toml` — use `wrangler secret put` only
+5. The `.env.example` file at repo root is for documentation only — it contains no real values
+
+---
+
+## Webhook Security
+
+All webhook requests to `/webhook` must include a valid HMAC-SHA256 signature in the `X-Sovereign-Signature` header.
+
+### Signature verification (Worker)
+
+```typescript
+// Compute expected signature
+const key = await crypto.subtle.importKey(
+  "raw",
+  new TextEncoder().encode(env.WORKER_HMAC_SECRET),
+  { name: "HMAC", hash: "SHA-256" },
+  false,
+  ["verify"]
+);
+const valid = await crypto.subtle.verify("HMAC", key, sigBytes, bodyBytes);
+```
+
+### Signing webhooks (sender side)
+
+```typescript
+const sig = await crypto.subtle.sign(
+  "HMAC",
+  key,
+  new TextEncoder().encode(body)
+);
+const hexSig = Array.from(new Uint8Array(sig))
+  .map(b => b.toString(16).padStart(2, "0"))
+  .join("");
+// Send as: X-Sovereign-Signature: <hexSig>
+```
+
+### Stripe webhook integration
+
+Stripe's native signature (`Stripe-Signature`) is **not** used directly. Instead, the Stripe webhook adapter (in the backend service) re-signs the event using `WORKER_HMAC_SECRET` before forwarding to the Worker. This decouples the Worker from Stripe's signature scheme.
+
+---
+
+## PII Handling
+
+### What the Worker stores
+
+| Field | Stored where | Retention |
+|-------|-------------|-----------|
+| `user_id` | `agent_runs`, `loop_messages` | Follows Supabase retention policy |
+| `space`, `model`, `status` | `agent_runs` | Follows Supabase retention policy |
+| `content` (loop messages) | `loop_messages` | User-controlled |
+| Date of birth | **Not stored** — used only in prompt context, never persisted by Worker |
+| AI responses | `loop_messages` only | User-controlled |
+
+### What the Worker never stores
+
+- Raw request payloads (alignment questions, compression content, defrag entries)
+- IP addresses
+- User agent strings
+- Authentication tokens
+
+### Data minimisation principles
+
+1. Alignment readings are returned to the client and not persisted by the Worker.
+2. The DOB is included in the AI prompt but never written to any database table.
+3. `agent_runs` contains only metadata (space, model, latency, status) — no content.
+
+### GDPR / deletion
+
+When a user deletes their account, the frontend calls the Supabase `profiles` delete endpoint. Cascade deletes via Supabase RLS/triggers should cover `agent_runs` and `loop_messages`. Verify cascade rules in `db/migrations/`.
+
+---
+
+## Content Security Policy
+
+The Worker sets the following security headers on all responses:
+
+```
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: strict-origin-when-cross-origin
+```
+
+The frontend (`next.config.ts`) sets additional headers including a full CSP. The Worker does **not** set a CSP header — that is the frontend's responsibility.
+
+### Recommended CSP for sovereign.os (frontend)
+
+```
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' 'nonce-{SERVER_NONCE}';
+  connect-src 'self' https://api.sovereign.os https://api-staging.sovereign.os
+              https://*.supabase.co wss://*.supabase.co;
+  style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+  font-src 'self' https://fonts.gstatic.com;
+  img-src 'self' data: blob:;
+  frame-ancestors 'none';
+  upgrade-insecure-requests;
+```
+
+---
+
+## Dependency Security
+
+### Audit
 
 ```bash
-# Audit dependencies in the Worker
-cd workers/switchboard && npm audit
-
-# Pin exact versions in package.json (already done for production dependencies)
-# Use `npm ci` in CI — never `npm install`
-
-# Update dependencies monthly
-npm outdated
-npm update
+# Run in workers/switchboard/
+npm audit
+npm audit --audit-level=high  # CI gate — fail on high+ severity
 ```
 
-Enable **Dependabot** for the repository:
-- `.github/dependabot.yml` with `npm` ecosystem, weekly schedule, targeting `workers/switchboard/`.
+CI runs `npm audit` on every push. High-severity vulnerabilities block the deploy.
+
+### Lockfile
+
+`package-lock.json` is committed for reproducible installs. Do not run `npm install` without committing the updated lockfile.
+
+### Supply chain
+
+- All dependencies are pinned to exact versions in `package.json`
+- Hono, the AI SDK, and Zod are all audited, actively maintained packages
+- `@cloudflare/workers-types` is a dev-only type package — not bundled
 
 ---
 
-## 9. Observability & Alerting
+## Incident Response
 
-### 9.1 Cloudflare Observability
+### Suspected key compromise
 
-In `wrangler.toml`:
-```toml
-[observability]
-enabled = true
-head_sampling_rate = 1  # 100% in staging; set to 0.1 in production
-```
+1. **Immediately** rotate the affected secret (`wrangler secret put <KEY> --env production`)
+2. Check Cloudflare Workers logs for abnormal usage in the past 24h
+3. Check Supabase `agent_runs` for unexpected user_ids or high-volume calls
+4. Revoke the old key at the provider (Google AI Studio, Supabase, Foundry)
+5. Post incident report to Slack `#security-incidents`
 
-Access in Cloudflare dashboard → **Workers & Pages → sovereign-switchboard-production → Observability**.
+### Worker returning 5xx in production
 
-### 9.2 Sentry integration (optional)
+1. Check `/health` endpoint for degraded subsystem
+2. Check Cloudflare Workers analytics for error rate spike
+3. Check Supabase status page (status.supabase.com)
+4. Check Google AI status (status.cloud.google.com)
+5. If Gemini is down: Worker will return 500 — frontend shows "try again" message automatically
+6. If Supabase is down: rate limits and auth fail open; AI calls still work
 
-If `SENTRY_DSN` is set, add to `index.ts`:
+### Rollback procedure
 
-```typescript
-import * as Sentry from "@sentry/cloudflare";
+See [worker-deploy.md → Rollback](./worker-deploy.md#rollback) for step-by-step instructions.
 
-export default Sentry.withSentry(
-  (env: Env) => ({
-    dsn: env.SENTRY_DSN,
-    tracesSampleRate: 0.1,
-    environment: env.ENVIRONMENT,
-  }),
-  app
-);
-```
+### Contact
 
-Install: `npm install @sentry/cloudflare`
-
-### 9.3 Datadog integration (optional)
-
-Use the `DATADOG_API_KEY` secret to emit custom metrics via the Datadog HTTP API from the Worker:
-
-```typescript
-async function emitMetric(apiKey: string, metric: string, value: number, tags: string[]) {
-  await fetch("https://api.datadoghq.com/api/v2/series", {
-    method: "POST",
-    headers: { "DD-API-KEY": apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      series: [{ metric, type: 1, points: [{ timestamp: Math.floor(Date.now() / 1000), value }], tags }],
-    }),
-  });
-}
-```
-
-### 9.4 Key metrics to alert on
-
-| Metric | Threshold | Action |
-|--------|-----------|--------|
-| `/health` returns 503 | Any occurrence | Page on-call |
-| Error rate | > 5% over 5 min | Alert |
-| P99 latency | > 10 s | Alert |
-| Token usage / day | > 80% of quota | Warn |
-| Circuit breaker open | Any occurrence | Alert |
+| Role | Channel |
+|------|---------|
+| On-call engineer | PagerDuty rotation |
+| Security incidents | `#security-incidents` Slack |
+| Cloudflare support | dashboard.cloudflare.com/support |
+| Supabase support | supabase.com/support |

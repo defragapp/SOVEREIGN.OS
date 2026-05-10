@@ -1,48 +1,41 @@
-/**
- * index.ts — Sovereign AI Switchboard
- * Cloudflare Worker using Hono v4
- * Routes: /dispatch, /health, /webhook
- */
+// workers/switchboard/src/index.ts
+// Sovereign AI Switchboard — Hono v4 Cloudflare Worker
+// Entry point: all routes, middleware, CORS, rate-limiting, error handling.
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { secureHeaders } from "hono/secure-headers";
 import { logger } from "hono/logger";
+import { secureHeaders } from "hono/secure-headers";
 import { timing } from "hono/timing";
-import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
-import { nanoid } from "nanoid";
 
+import { SupabaseClient } from "./supabase_client";
+import { FoundryClient } from "./foundry_client";
+import {
+  generateStructured,
+  streamAI,
+  probeAI,
+  embedText,
+  MODELS,
+} from "./ai_client";
+import { sdkStreamToSse } from "./stream_helpers";
 import {
   DispatchRequestSchema,
   AlignmentRequestSchema,
+  AlignmentResponseSchema,
   CompressionRequestSchema,
+  CompressionResponseSchema,
+  DefragRequestSchema,
+  DefragResponseSchema,
+  LoopRequestSchema,
   WebhookEventSchema,
-  type ErrorResponse,
+  type AlignmentResponse,
+  type CompressionResponse,
+  type DefragResponse,
+  type HealthResponse,
 } from "./schemas";
-import {
-  runAlignment,
-  runCompression,
-  runSimulatorStream,
-  embedTexts,
-  probeAI,
-} from "./ai_client";
-import {
-  sdkStreamToSSE,
-  sdkStreamToNDJSON,
-  withStreamTimeout,
-  readBodyWithLimit,
-} from "./stream_helpers";
-import {
-  createSupabaseClient,
-  insertAgentRun,
-  completeAgentRun,
-  insertLoopMessage,
-  SupabaseError,
-} from "./supabase_client";
-import { createFoundryClient } from "./foundry_client";
 
-// ─── Env bindings (matches wrangler.toml) ─────────────────────────────────────
+// ─── Env bindings (declared in wrangler.toml) ─────────────────────────────────
 
 export interface Env {
   GEMINI_API_KEY: string;
@@ -50,530 +43,683 @@ export interface Env {
   SUPABASE_SERVICE_ROLE_KEY: string;
   FOUNDRY_API_URL: string;
   FOUNDRY_API_KEY: string;
+  WORKER_HMAC_SECRET: string;
   SENTRY_DSN?: string;
   DATADOG_API_KEY?: string;
-  S3_BUCKET?: string;
-  S3_KEY?: string;
-  S3_SECRET?: string;
-  /** Set to "staging" | "production" */
-  ENVIRONMENT: string;
-  /** Shared secret for webhook signature verification */
-  WEBHOOK_SECRET: string;
+  ENVIRONMENT: string; // "staging" | "production"
 }
 
-// ─── Allowed origins (tightened CORS) ────────────────────────────────────────
+// ─── Allowed origins ──────────────────────────────────────────────────────────
 
 const ALLOWED_ORIGINS = [
   "https://sovereign.os",
   "https://www.sovereign.os",
-  "https://app.sovereign.os",
-  // Vercel preview URLs
-  /^https:\/\/sovereign.*\.vercel\.app$/,
+  "https://staging.sovereign.os",
+  "http://localhost:3000",
+  "http://localhost:3001",
 ];
 
-function isOriginAllowed(origin: string): boolean {
-  return ALLOWED_ORIGINS.some((o) =>
-    typeof o === "string" ? o === origin : o.test(origin)
-  );
-}
+// ─── Rate limit config per space ──────────────────────────────────────────────
+
+const RATE_LIMITS: Record<string, { windowHours: number; max: number } | null> = {
+  launcher: null,       // unlimited
+  defrag: { windowHours: 24, max: 3 },
+  alignment: { windowHours: 24, max: 5 },
+  the_loop: { windowHours: 24, max: 3 },
+  compression: null,    // pro — unlimited
+  covenant: null,       // pro — unlimited
+};
+
+// ─── Pro-only spaces ──────────────────────────────────────────────────────────
+
+const PRO_SPACES = new Set(["compression", "covenant"]);
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 const app = new Hono<{ Bindings: Env }>();
 
-// ── Middleware ────────────────────────────────────────────────────────────────
+// ─── Global middleware ────────────────────────────────────────────────────────
 
 app.use("*", timing());
 app.use("*", logger());
-app.use("*", secureHeaders());
+app.use(
+  "*",
+  secureHeaders({
+    xContentTypeOptions: "nosniff",
+    xFrameOptions: "DENY",
+    referrerPolicy: "strict-origin-when-cross-origin",
+  })
+);
 
-// Dynamic CORS — allow listed origins only
+app.use(
+  "*",
+  cors({
+    origin: (origin) => (ALLOWED_ORIGINS.includes(origin) ? origin : null),
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization", "X-Idempotency-Key", "X-Request-ID"],
+    exposeHeaders: ["X-Request-ID", "X-RateLimit-Remaining"],
+    maxAge: 86400,
+    credentials: true,
+  })
+);
+
+// ─── Request ID middleware ────────────────────────────────────────────────────
+
 app.use("*", async (c, next) => {
-  const origin = c.req.header("origin") ?? "";
-  const allowed = isOriginAllowed(origin);
-
-  if (c.req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": allowed ? origin : "",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Idempotency-Key",
-        "Access-Control-Max-Age": "86400",
-        Vary: "Origin",
-      },
-    });
-  }
-
-  await next();
-
-  if (allowed) {
-    c.res.headers.set("Access-Control-Allow-Origin", origin);
-    c.res.headers.set("Vary", "Origin");
-  }
-});
-
-// Request ID injection
-app.use("*", async (c, next) => {
-  const requestId = c.req.header("x-request-id") ?? nanoid(16);
+  const requestId =
+    c.req.header("X-Request-ID") ?? crypto.randomUUID();
   c.set("requestId" as never, requestId);
   await next();
-  c.res.headers.set("X-Request-Id", requestId);
+  c.res.headers.set("X-Request-ID", requestId);
 });
 
-// ── Error handler ─────────────────────────────────────────────────────────────
+// ─── Request size guard (256 KB hard limit) ────────────────────────────────
 
-app.onError((err, c) => {
-  const requestId = (c.get("requestId" as never) as string) ?? "unknown";
-  console.error(`[${requestId}] Unhandled error:`, err);
-
-  if (err instanceof HTTPException) {
-    return c.json<ErrorResponse>(
-      {
-        error: {
-          code: "HTTP_EXCEPTION",
-          message: err.message,
-          request_id: requestId,
-          retryable: err.status >= 500,
-        },
-      },
-      err.status as Parameters<typeof c.json>[1]
-    );
+app.use("/dispatch", async (c, next) => {
+  const contentLength = c.req.header("Content-Length");
+  if (contentLength && parseInt(contentLength, 10) > 256_000) {
+    return c.json({ error: "Request body too large", code: "PAYLOAD_TOO_LARGE" }, 413);
   }
-
-  const status = (err as { status?: number }).status ?? 500;
-  const code = (err as { code?: string }).code ?? "INTERNAL_ERROR";
-
-  return c.json<ErrorResponse>(
-    {
-      error: {
-        code,
-        message: err.message ?? "An unexpected error occurred",
-        request_id: requestId,
-        retryable: status >= 500,
-      },
-    },
-    status as Parameters<typeof c.json>[1]
-  );
+  return next();
 });
 
-// ── /health ───────────────────────────────────────────────────────────────────
+// ─── /health ─────────────────────────────────────────────────────────────────
 
 app.get("/health", async (c) => {
-  const env = c.env;
-  const db = createSupabaseClient(env);
+  const supabase = new SupabaseClient(c.env);
+  const foundry = new FoundryClient(c.env);
 
-  const [dbProbe, aiProbe] = await Promise.allSettled([
-    db.probe(),
-    probeAI(env.GEMINI_API_KEY),
+  const [aiResult, dbResult, foundryResult] = await Promise.allSettled([
+    probeAI(c.env),
+    supabase
+      .select("agent_runs", { select: "id", limit: 1 })
+      .then(() => ({ ok: true, latency_ms: 0 }))
+      .catch(() => ({ ok: false, latency_ms: 0 })),
+    foundry.probe(),
   ]);
 
-  const dbResult =
-    dbProbe.status === "fulfilled"
-      ? dbProbe.value
-      : { ok: false, latency_ms: -1 };
-  const aiResult =
-    aiProbe.status === "fulfilled"
-      ? aiProbe.value
-      : { ok: false, latency_ms: -1 };
+  const ai = aiResult.status === "fulfilled" ? aiResult.value : { ok: false, latency_ms: 0 };
+  const db = dbResult.status === "fulfilled" ? dbResult.value : { ok: false, latency_ms: 0 };
+  const fd = foundryResult.status === "fulfilled" ? foundryResult.value : { ok: false, latency_ms: 0 };
 
-  const healthy = dbResult.ok && aiResult.ok;
+  const allHealthy = ai.ok && db.ok;
+  const status: HealthResponse["status"] = allHealthy
+    ? "healthy"
+    : ai.ok || db.ok
+    ? "degraded"
+    : "unhealthy";
 
-  return c.json(
-    {
-      status: healthy ? "healthy" : "degraded",
-      environment: env.ENVIRONMENT ?? "unknown",
-      checks: {
-        database: { ok: dbResult.ok, latency_ms: dbResult.latency_ms },
-        ai: { ok: aiResult.ok, latency_ms: aiResult.latency_ms },
-      },
-      timestamp: new Date().toISOString(),
+  const body: HealthResponse = {
+    status,
+    version: "1.0.0",
+    timestamp: new Date().toISOString(),
+    checks: {
+      supabase: db.ok ? "ok" : "error",
+      ai: ai.ok ? "ok" : "error",
+      foundry: fd.ok ? "ok" : "error",
     },
-    healthy ? 200 : 503
-  );
+    latency_ms: {
+      ai: ai.latency_ms,
+      db: db.latency_ms,
+      foundry: fd.latency_ms,
+    },
+  };
+
+  return c.json(body, allHealthy ? 200 : 503);
 });
 
-// ── /dispatch ─────────────────────────────────────────────────────────────────
+// ─── /dispatch ────────────────────────────────────────────────────────────────
 
 app.post("/dispatch", async (c) => {
-  const requestId = (c.get("requestId" as never) as string) ?? nanoid(16);
-  const env = c.env;
-  const db = createSupabaseClient(env);
-  const runId = nanoid(21);
-  const now = new Date().toISOString();
+  const requestId = (c.get("requestId" as never) as string) ?? crypto.randomUUID();
 
-  // Parse body
-  let rawBody: unknown;
+  // --- Parse outer envelope
+  let body: unknown;
   try {
-    rawBody = await readBodyWithLimit(c.req.raw, 512_000);
-  } catch (err: unknown) {
-    const e = err as { status?: number; code?: string; message?: string };
-    return c.json<ErrorResponse>(
-      {
-        error: {
-          code: e.code ?? "PARSE_ERROR",
-          message: e.message ?? "Failed to parse request body",
-          request_id: requestId,
-          retryable: false,
-        },
-      },
-      (e.status ?? 400) as Parameters<typeof c.json>[1]
-    );
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON", code: "BAD_REQUEST", request_id: requestId }, 400);
   }
 
-  // Validate dispatch envelope
-  const parseResult = DispatchRequestSchema.safeParse(rawBody);
-  if (!parseResult.success) {
-    return c.json<ErrorResponse>(
-      {
-        error: {
-          code: "VALIDATION_ERROR",
-          message: "Request body does not match expected schema",
-          request_id: requestId,
-          retryable: false,
-          details: parseResult.error.flatten(),
-        },
-      },
+  const envelope = DispatchRequestSchema.safeParse(body);
+  if (!envelope.success) {
+    return c.json(
+      { error: "Validation failed", code: "VALIDATION_ERROR", details: envelope.error.flatten(), request_id: requestId },
       422
     );
   }
 
-  const dispatch = parseResult.data;
-  const idempotencyKey =
-    c.req.header("x-idempotency-key") ??
-    ("idempotency_key" in dispatch.payload ? dispatch.payload.idempotency_key : undefined);
+  const { space, user_id, payload, idempotency_key } = envelope.data;
+  const supabase = new SupabaseClient(c.env);
 
-  // ── ALIGNMENT ──────────────────────────────────────────────────────────────
-
-  if (dispatch.operation === "alignment") {
-    const req = dispatch.payload;
-    const t0 = Date.now();
-
-    // Record run start
-    await insertAgentRun(db, {
-      id: runId,
-      agent_id: req.agent_id,
-      session_id: req.session_id,
-      operation: "alignment",
-      status: "running",
-      input_summary: req.prompt.slice(0, 256),
-      created_at: now,
-    }).catch(() => {/* non-fatal — don't block on DB write */});
-
-    // Streaming path
-    if (req.stream) {
-      return withStreamTimeout(async () => {
-        const { runSimulatorStream: _, ...aiMod } = await import("./ai_client");
-        const streamResult = await import("./ai_client").then((m) =>
-          m.runSimulatorStream(
-            env.GEMINI_API_KEY,
-            [
-              {
-                role: "system" as const,
-                content:
-                  "You are SOVEREIGN ALIGNMENT EVALUATOR. Provide streaming alignment analysis.",
-              },
-              { role: "user" as const, content: req.prompt },
-            ],
-            2048,
-            req.temperature
-          )
-        );
-        return sdkStreamToSSE(streamResult, req.session_id);
-      }, 25_000);
-    }
-
-    // Non-streaming — structured JSON
-    try {
-      const result = await runAlignment(
-        env.GEMINI_API_KEY,
-        req.prompt,
-        req.context_window,
-        req.temperature
-      );
-
-      const output = {
-        session_id: req.session_id,
-        agent_id: req.agent_id,
-        status: result.status,
-        score: result.score,
-        reasoning: result.reasoning,
-        recommendations: result.recommendations,
-        token_usage: result.usage,
-        latency_ms: result.latency_ms,
-        model: result.model,
-        created_at: now,
-      };
-
-      // Persist result
-      await completeAgentRun(db, runId, {
-        status: "completed",
-        output_summary: `score=${result.score} status=${result.status}`,
-        token_usage: result.usage,
-        completed_at: new Date().toISOString(),
-      }).catch(() => {});
-
-      return c.json(output, 200);
-    } catch (err) {
-      await completeAgentRun(db, runId, {
-        status: "failed",
-        error_message: err instanceof Error ? err.message : "Unknown error",
-        completed_at: new Date().toISOString(),
-      }).catch(() => {});
-      throw err;
+  // --- Idempotency check (webhook-grade — store key to prevent double-exec)
+  if (idempotency_key) {
+    const existing = await supabase
+      .selectOne("agent_runs", {
+        filters: { idempotency_key, user_id },
+        select: "id,status",
+      })
+      .catch(() => null);
+    if (existing) {
+      return c.json({ cached: true, message: "Idempotent response" }, 200);
     }
   }
 
-  // ── COMPRESSION ────────────────────────────────────────────────────────────
-
-  if (dispatch.operation === "compression") {
-    const req = dispatch.payload;
-    const t0 = Date.now();
-
-    await insertAgentRun(db, {
-      id: runId,
-      agent_id: "compression-agent",
-      session_id: req.session_id,
-      operation: "compression",
-      status: "running",
-      input_summary: `len=${req.content.length} ratio=${req.target_ratio}`,
-      created_at: now,
-    }).catch(() => {});
-
-    try {
-      const result = await runCompression(
-        env.GEMINI_API_KEY,
-        req.content,
-        req.target_ratio,
-        req.preserve_keys,
-        req.format
+  // --- Pro gate
+  if (PRO_SPACES.has(space)) {
+    const profile = await supabase
+      .selectOne<{ tier: string }>("profiles", {
+        filters: { id: user_id },
+        select: "tier",
+      })
+      .catch(() => null);
+    if (!profile || profile.tier !== "pro") {
+      return c.json(
+        { error: "Pro subscription required", code: "UPGRADE_REQUIRED", request_id: requestId },
+        403
       );
-
-      const output = {
-        session_id: req.session_id,
-        original_length: req.content.length,
-        compressed_length: result.compressed_content.length,
-        actual_ratio: result.compressed_content.length / req.content.length,
-        compressed_content: result.compressed_content,
-        format: req.format,
-        token_usage: result.usage,
-        latency_ms: result.latency_ms,
-        model: result.model,
-        created_at: now,
-      };
-
-      await completeAgentRun(db, runId, {
-        status: "completed",
-        output_summary: `compressed ${req.content.length}→${result.compressed_content.length}`,
-        token_usage: result.usage,
-        completed_at: new Date().toISOString(),
-      }).catch(() => {});
-
-      return c.json(output, 200);
-    } catch (err) {
-      await completeAgentRun(db, runId, {
-        status: "failed",
-        error_message: err instanceof Error ? err.message : "Unknown error",
-        completed_at: new Date().toISOString(),
-      }).catch(() => {});
-      throw err;
     }
   }
 
-  // ── SIMULATOR (streaming) ─────────────────────────────────────────────────
-
-  if (dispatch.operation === "simulator") {
-    const req = dispatch.payload;
-
-    return withStreamTimeout(async () => {
-      const streamResult = runSimulatorStream(
-        env.GEMINI_API_KEY,
-        req.messages as Parameters<typeof runSimulatorStream>[1],
-        req.max_tokens,
-        req.temperature
-      );
-
-      // Persist loop messages async
-      (async () => {
-        const lastUserMsg = [...req.messages].reverse().find((m) => m.role === "user");
-        if (lastUserMsg && req.loop_id) {
-          await insertLoopMessage(db, {
-            id: nanoid(21),
-            loop_id: req.loop_id,
-            session_id: req.session_id,
-            role: "user",
-            content: lastUserMsg.content,
-            created_at: now,
-          }).catch(() => {});
-        }
-      })();
-
-      const acceptHeader = c.req.header("accept") ?? "";
-      if (acceptHeader.includes("application/x-ndjson")) {
-        return sdkStreamToNDJSON(streamResult, req.session_id);
-      }
-      return sdkStreamToSSE(streamResult, req.session_id);
-    }, 25_000);
-  }
-
-  // ── EMBED ─────────────────────────────────────────────────────────────────
-
-  if (dispatch.operation === "embed") {
-    const req = dispatch.payload;
-
-    const result = await embedTexts(env.GEMINI_API_KEY, req.texts);
-
-    return c.json(
-      {
-        session_id: req.session_id,
-        embeddings: result.embeddings,
-        model: result.model,
-        dim: result.dim,
-        count: result.embeddings.length,
-        created_at: now,
-      },
-      200
+  // --- Rate limit check (free spaces)
+  const rateConfig = RATE_LIMITS[space];
+  if (rateConfig) {
+    const { allowed, remaining } = await supabase.checkRateLimit(
+      user_id,
+      space,
+      rateConfig.windowHours,
+      rateConfig.max
     );
+    c.res.headers.set("X-RateLimit-Remaining", String(remaining));
+    if (!allowed) {
+      return c.json(
+        { error: "Daily limit reached. Come back tomorrow.", code: "RATE_LIMITED", request_id: requestId },
+        429
+      );
+    }
   }
 
-  // Should never reach here (discriminated union exhausts all cases)
-  return c.json<ErrorResponse>(
-    {
-      error: {
-        code: "UNKNOWN_OPERATION",
-        message: "Unsupported dispatch operation",
-        request_id: requestId,
-        retryable: false,
-      },
-    },
-    400
-  );
+  // --- Route to space handler
+  try {
+    switch (space) {
+      case "alignment":
+        return handleAlignment(c, user_id, payload, requestId, supabase, idempotency_key);
+      case "compression":
+        return handleCompression(c, user_id, payload, requestId, supabase, idempotency_key);
+      case "defrag":
+        return handleDefrag(c, user_id, payload, requestId, supabase, idempotency_key);
+      case "the_loop":
+        return handleLoop(c, user_id, payload, requestId, supabase);
+      case "launcher":
+        return handleLauncher(c, user_id, payload, requestId, supabase);
+      case "covenant":
+        return handleCovenant(c, user_id, payload, requestId, supabase, idempotency_key);
+      default:
+        return c.json({ error: "Unknown space", code: "NOT_FOUND", request_id: requestId }, 404);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Internal error";
+    await supabase.logRun({
+      user_id,
+      space,
+      model: "unknown",
+      status: "error",
+      error: message,
+      idempotency_key,
+    });
+    return c.json({ error: "Something went wrong. Please try again.", code: "INTERNAL_ERROR", request_id: requestId }, 500);
+  }
 });
 
-// ── /webhook ──────────────────────────────────────────────────────────────────
+// ─── Space handlers ────────────────────────────────────────────────────────────
+
+async function handleAlignment(
+  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
+  userId: string,
+  payload: Record<string, unknown>,
+  requestId: string,
+  supabase: SupabaseClient,
+  idempotencyKey?: string
+) {
+  const parsed = AlignmentRequestSchema.safeParse(payload);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid alignment payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
+      422
+    );
+  }
+
+  const { dob, time_of_birth, timezone, question, depth } = parsed.data;
+  const start = Date.now();
+
+  const system = `You are the Alignment guide within Sovereign OS — a reflective astro-psychological intelligence. 
+You help users understand themselves through the lens of natal chart archetypes and Jungian depth psychology.
+Never use: generate, process, analyze, data, model, diagnose, pattern-match, algorithm.
+Always use: understand, discover, explore, find, feel, guide, reflect, move forward.
+Output strictly valid JSON matching the schema. No markdown code fences.`;
+
+  const prompt = `User's date of birth: ${dob}
+Time of birth: ${time_of_birth ?? "unknown"}
+Timezone: ${timezone}
+Depth: ${depth}
+${question ? `Question: ${question}` : "Provide a general natal reading."}
+
+Respond with a JSON object: { reading, archetypes (array, max 5), guidance, themes (array, max 7), generated_at (ISO datetime) }`;
+
+  const result = await generateStructured<AlignmentResponse>({
+    env: c.env,
+    modelKey: depth === "deep" ? "pro" : "flash",
+    schema: AlignmentResponseSchema,
+    schemaName: "AlignmentResponse",
+    system,
+    prompt,
+    temperature: 0.6,
+    maxTokens: depth === "deep" ? 3000 : 1200,
+  });
+
+  const latency = Date.now() - start;
+  await supabase.logRun({
+    user_id: userId,
+    space: "alignment",
+    model: depth === "deep" ? MODELS.pro : MODELS.flash,
+    input_tokens: result.usage?.promptTokens,
+    output_tokens: result.usage?.completionTokens,
+    latency_ms: latency,
+    status: "success",
+    idempotency_key: idempotencyKey,
+  });
+
+  return c.json(result.object, 200);
+}
+
+async function handleCompression(
+  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
+  userId: string,
+  payload: Record<string, unknown>,
+  requestId: string,
+  supabase: SupabaseClient,
+  idempotencyKey?: string
+) {
+  const parsed = CompressionRequestSchema.safeParse(payload);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid compression payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
+      422
+    );
+  }
+
+  const { content, mode, output_format, preserve_voice } = parsed.data;
+  const wordCountOriginal = content.split(/\s+/).filter(Boolean).length;
+  const start = Date.now();
+
+  const system = `You are Compression within Sovereign OS — you help users distill, reframe, and crystallise their thoughts.
+Never use: generate, process, analyze, data, model, diagnose, pattern-match, algorithm.
+Always use: understand, discover, explore, find, feel, guide, reflect, move forward.
+${preserve_voice ? "Preserve the user's authentic voice and tone." : ""}
+Output strictly valid JSON. No markdown fences.`;
+
+  const prompt = `Mode: ${mode}. Output format: ${output_format}.
+Content to ${mode}:
+${content}
+
+Respond with JSON: { compressed (string), word_count_original (${wordCountOriginal}), word_count_compressed (int), compression_ratio (float 0-1), mode ("${mode}"), generated_at (ISO datetime) }`;
+
+  const result = await generateStructured<CompressionResponse>({
+    env: c.env,
+    modelKey: "flash",
+    schema: CompressionResponseSchema,
+    schemaName: "CompressionResponse",
+    system,
+    prompt,
+    temperature: 0.4,
+    maxTokens: 2048,
+  });
+
+  const latency = Date.now() - start;
+  await supabase.logRun({
+    user_id: userId,
+    space: "compression",
+    model: MODELS.flash,
+    input_tokens: result.usage?.promptTokens,
+    output_tokens: result.usage?.completionTokens,
+    latency_ms: latency,
+    status: "success",
+    idempotency_key: idempotencyKey,
+  });
+
+  return c.json(result.object, 200);
+}
+
+async function handleDefrag(
+  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
+  userId: string,
+  payload: Record<string, unknown>,
+  requestId: string,
+  supabase: SupabaseClient,
+  idempotencyKey?: string
+) {
+  const parsed = DefragRequestSchema.safeParse(payload);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid defrag payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
+      422
+    );
+  }
+
+  const { entries, goal, output_format } = parsed.data;
+  const start = Date.now();
+
+  const system = `You are Defrag within Sovereign OS — you help users find hidden structure in their scattered thoughts.
+Never use: generate, process, analyze, data, model, diagnose, pattern-match, algorithm.
+Always use: understand, discover, explore, find, feel, guide, reflect, move forward.
+Output strictly valid JSON. No markdown fences.`;
+
+  const prompt = `Format: ${output_format}. Goal: ${goal ?? "surface natural clusters and insights"}.
+Entries (${entries.length}):
+${entries.map((e) => `[${e.id}] ${e.text}`).join("\n")}
+
+Respond with JSON: { clusters: [{ label, theme, entry_ids, insight }], overall_pattern, next_focus, generated_at }`;
+
+  const result = await generateStructured<DefragResponse>({
+    env: c.env,
+    modelKey: "flash",
+    schema: DefragResponseSchema,
+    schemaName: "DefragResponse",
+    system,
+    prompt,
+    temperature: 0.5,
+    maxTokens: 2000,
+  });
+
+  const latency = Date.now() - start;
+  await supabase.logRun({
+    user_id: userId,
+    space: "defrag",
+    model: MODELS.flash,
+    latency_ms: latency,
+    status: "success",
+    idempotency_key: idempotencyKey,
+  });
+
+  return c.json(result.object, 200);
+}
+
+async function handleLoop(
+  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
+  userId: string,
+  payload: Record<string, unknown>,
+  requestId: string,
+  supabase: SupabaseClient
+) {
+  const parsed = LoopRequestSchema.safeParse(payload);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid loop payload", code: "VALIDATION_ERROR", details: parsed.error.flatten(), request_id: requestId },
+      422
+    );
+  }
+
+  const { agent_id, message, conversation_id, stream, embed } = parsed.data;
+
+  // Load agent manifest from Supabase
+  const agent = await supabase
+    .selectOne<{ system_prompt: string; model_preference: string; max_tokens: number; temperature: number }>("agent_manifests", {
+      filters: { id: agent_id },
+      select: "system_prompt,model_preference,max_tokens,temperature",
+    })
+    .catch(() => null);
+
+  if (!agent) {
+    return c.json({ error: "Agent not found", code: "NOT_FOUND", request_id: requestId }, 404);
+  }
+
+  // Store message in loop_messages
+  const convId = conversation_id ?? crypto.randomUUID();
+  await supabase.insert("loop_messages", {
+    conversation_id: convId,
+    user_id: userId,
+    agent_id,
+    role: "user",
+    content: message,
+    created_at: new Date().toISOString(),
+  }).catch(() => {});
+
+  // Generate embedding if requested
+  if (embed) {
+    const embedding = await embedText(c.env, message, "RETRIEVAL_DOCUMENT").catch(() => null);
+    if (embedding) {
+      await supabase.update(
+        "loop_messages",
+        { embedding: JSON.stringify(embedding) },
+        { conversation_id: convId, role: "user" }
+      ).catch(() => {});
+    }
+  }
+
+  const modelKey = agent.model_preference === "gemini-1.5-pro" ? "pro" : "flash";
+
+  if (stream) {
+    const result = streamAI({
+      env: c.env,
+      modelKey,
+      system: agent.system_prompt,
+      messages: [{ role: "user", content: message }],
+      temperature: agent.temperature,
+      maxTokens: agent.max_tokens,
+      abortSignal: c.req.raw.signal ?? undefined,
+    });
+
+    // Store assistant response async (best-effort)
+    result.text.then((text) => {
+      supabase.insert("loop_messages", {
+        conversation_id: convId,
+        user_id: userId,
+        agent_id,
+        role: "assistant",
+        content: text,
+        created_at: new Date().toISOString(),
+      }).catch(() => {});
+      supabase.logRun({ user_id: userId, space: "the_loop", model: agent.model_preference, status: "success" }).catch(() => {});
+    }).catch(() => {});
+
+    return sdkStreamToSse(result);
+  }
+
+  // Non-streaming fallback
+  const { generateText } = await import("ai");
+  const { createGoogleGenerativeAI } = await import("@ai-sdk/google");
+  const google = createGoogleGenerativeAI({ apiKey: c.env.GEMINI_API_KEY });
+  const res = await generateText({
+    model: google(agent.model_preference),
+    system: agent.system_prompt,
+    messages: [{ role: "user", content: message }],
+    temperature: agent.temperature,
+    maxTokens: agent.max_tokens,
+  });
+
+  await supabase.insert("loop_messages", {
+    conversation_id: convId,
+    user_id: userId,
+    agent_id,
+    role: "assistant",
+    content: res.text,
+    created_at: new Date().toISOString(),
+  }).catch(() => {});
+
+  return c.json({ text: res.text, conversation_id: convId, generated_at: new Date().toISOString() }, 200);
+}
+
+async function handleLauncher(
+  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
+  userId: string,
+  payload: Record<string, unknown>,
+  requestId: string,
+  supabase: SupabaseClient
+) {
+  // Launcher is the entry-point selector — routes to appropriate sub-space
+  const intent = z
+    .object({ intent: z.string().min(1).max(2000) })
+    .safeParse(payload);
+
+  if (!intent.success) {
+    return c.json({ error: "Provide an intent string", code: "VALIDATION_ERROR", request_id: requestId }, 422);
+  }
+
+  const system = `You are the Sovereign OS Launcher — a routing intelligence that guides users to the right space.
+Available spaces: defrag (scatter→structure), alignment (self-understanding), the_loop (agent conversation), compression (distill content), covenant (commitments).
+Output JSON: { suggested_space: string, reason: string, opening_question: string }`;
+
+  const result = await generateStructured({
+    env: c.env,
+    modelKey: "flash",
+    schema: z.object({
+      suggested_space: z.string(),
+      reason: z.string(),
+      opening_question: z.string(),
+    }),
+    schemaName: "LauncherResponse",
+    system,
+    prompt: `User intent: ${intent.data.intent}`,
+    temperature: 0.5,
+    maxTokens: 256,
+  });
+
+  await supabase.logRun({ user_id: userId, space: "launcher", model: MODELS.flash, status: "success" }).catch(() => {});
+  return c.json(result.object, 200);
+}
+
+async function handleCovenant(
+  c: Parameters<typeof app.post>[1] extends (c: infer C, ...a: never[]) => never ? C : never,
+  userId: string,
+  payload: Record<string, unknown>,
+  requestId: string,
+  supabase: SupabaseClient,
+  idempotencyKey?: string
+) {
+  const parsed = z
+    .object({
+      commitment: z.string().min(10).max(2000),
+      timeframe: z.string().max(100).optional(),
+      reflection: z.string().max(2000).optional(),
+    })
+    .safeParse(payload);
+
+  if (!parsed.success) {
+    return c.json({ error: "Invalid covenant payload", code: "VALIDATION_ERROR", request_id: requestId }, 422);
+  }
+
+  const { commitment, timeframe, reflection } = parsed.data;
+  const system = `You are Covenant within Sovereign OS — a sacred space for making and honouring meaningful commitments.
+Help the user clarify, deepen, and find accountability in their commitments.
+Never use clinical or algorithmic language. Be warm, grounding, and present.
+Output JSON: { covenant_statement, witness_reflection, check_in_questions (array, max 3), generated_at }`;
+
+  const result = await generateStructured({
+    env: c.env,
+    modelKey: "pro",
+    schema: z.object({
+      covenant_statement: z.string(),
+      witness_reflection: z.string(),
+      check_in_questions: z.array(z.string()).max(3),
+      generated_at: z.string(),
+    }),
+    schemaName: "CovenantResponse",
+    system,
+    prompt: `Commitment: ${commitment}\nTimeframe: ${timeframe ?? "open"}\nReflection: ${reflection ?? "none"}`,
+    temperature: 0.65,
+    maxTokens: 1500,
+  });
+
+  await supabase.logRun({ user_id: userId, space: "covenant", model: MODELS.pro, status: "success", idempotency_key: idempotencyKey }).catch(() => {});
+  return c.json(result.object, 200);
+}
+
+// ─── /webhook ────────────────────────────────────────────────────────────────
 
 app.post("/webhook", async (c) => {
-  const requestId = (c.get("requestId" as never) as string) ?? nanoid(16);
-  const env = c.env;
-
-  // Verify signature (HMAC-SHA256 over raw body)
+  // HMAC-SHA256 verification
+  const signature = c.req.header("X-Sovereign-Signature");
   const rawBody = await c.req.text();
-  const signature = c.req.header("x-sovereign-signature");
 
-  if (env.WEBHOOK_SECRET && signature) {
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      "raw",
-      encoder.encode(env.WEBHOOK_SECRET),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["verify"]
-    );
+  if (!signature) {
+    return c.json({ error: "Missing signature", code: "UNAUTHORIZED" }, 401);
+  }
 
-    const sigBytes = hexToBytes(signature.replace(/^sha256=/, ""));
-    const bodyBytes = encoder.encode(rawBody);
-    const valid = await crypto.subtle.verify("HMAC", key, sigBytes, bodyBytes);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(c.env.WORKER_HMAC_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
 
-    if (!valid) {
-      return c.json<ErrorResponse>(
-        {
-          error: {
-            code: "INVALID_SIGNATURE",
-            message: "Webhook signature verification failed",
-            request_id: requestId,
-            retryable: false,
-          },
-        },
-        401
-      );
-    }
+  const sigBytes = hexToBytes(signature);
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    sigBytes,
+    new TextEncoder().encode(rawBody)
+  );
+
+  if (!valid) {
+    return c.json({ error: "Invalid signature", code: "FORBIDDEN" }, 403);
   }
 
   let body: unknown;
   try {
     body = JSON.parse(rawBody);
   } catch {
-    return c.json<ErrorResponse>(
-      {
-        error: { code: "PARSE_ERROR", message: "Invalid JSON body", request_id: requestId, retryable: false },
-      },
-      400
-    );
+    return c.json({ error: "Invalid JSON", code: "BAD_REQUEST" }, 400);
   }
 
-  const parseResult = WebhookEventSchema.safeParse(body);
-  if (!parseResult.success) {
-    return c.json<ErrorResponse>(
-      {
-        error: {
-          code: "VALIDATION_ERROR",
-          message: "Webhook body does not match expected schema",
-          request_id: requestId,
-          retryable: false,
-          details: parseResult.error.flatten(),
+  const event = WebhookEventSchema.safeParse(body);
+  if (!event.success) {
+    return c.json({ error: "Unknown event type", code: "VALIDATION_ERROR" }, 422);
+  }
+
+  const supabase = new SupabaseClient(c.env);
+
+  switch (event.data.type) {
+    case "stripe.checkout.session.completed": {
+      const { user_id, plan, stripe_customer_id, stripe_subscription_id } = event.data.data;
+      await supabase.upsert(
+        "profiles",
+        {
+          id: user_id,
+          tier: plan,
+          stripe_customer_id,
+          stripe_subscription_id,
+          updated_at: new Date().toISOString(),
         },
-      },
-      422
-    );
+        { onConflict: "id" }
+      );
+      break;
+    }
+    case "stripe.customer.subscription.deleted": {
+      const { user_id } = event.data.data;
+      await supabase.update("profiles", { tier: "free", stripe_subscription_id: null }, { id: user_id });
+      break;
+    }
   }
 
-  const event = parseResult.data;
-  const db = createSupabaseClient(env);
-
-  // Idempotency: store processed event ID (fire-and-forget)
-  await db
-    .insert(
-      "webhook_events",
-      {
-        id: event.event_id,
-        event_type: event.event_type,
-        idempotency_key: event.idempotency_key,
-        data: event.data,
-        processed_at: new Date().toISOString(),
-      },
-      { onConflict: "idempotency_key", ignoreDuplicates: true }
-    )
-    .catch(() => {});
-
-  // Route by event type
-  switch (event.event_type) {
-    case "agent.run.completed":
-    case "agent.run.failed":
-      console.log(`[webhook] ${event.event_type} – ${event.event_id}`);
-      break;
-    case "loop.message.created":
-    case "design.baseline.updated":
-      console.log(`[webhook] ${event.event_type} – ${event.event_id}`);
-      break;
-    case "billing.usage.threshold":
-      console.warn(`[webhook] Billing threshold reached – ${JSON.stringify(event.data)}`);
-      break;
-  }
-
-  return c.json({ received: true, event_id: event.event_id }, 200);
+  return c.json({ received: true }, 200);
 });
 
-// ── 404 catch-all ─────────────────────────────────────────────────────────────
+// ─── Global 404 & error handler ───────────────────────────────────────────────
 
-app.notFound((c) => {
-  return c.json<ErrorResponse>(
-    {
-      error: {
-        code: "NOT_FOUND",
-        message: `Route ${c.req.method} ${c.req.path} not found`,
-        retryable: false,
-      },
-    },
-    404
-  );
+app.notFound((c) => c.json({ error: "Route not found", code: "NOT_FOUND" }, 404));
+
+app.onError((err, c) => {
+  console.error("[switchboard] unhandled error:", err);
+  return c.json({ error: "Internal server error", code: "INTERNAL_ERROR" }, 500);
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
 function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
   }
   return bytes;
 }
