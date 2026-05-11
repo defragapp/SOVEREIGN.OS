@@ -5,11 +5,19 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "build:pages": "next build && next-on-pages build",
+    "export:pages": "next-on-pages build"
   },
   "dependencies": {
     "next": "^13.4.19",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@cloudflare/next-on-pages": "^1.13.16",
+    "@types/react": "19.2.14",
+    "cross-env": "^10.1.0",
+    "typescript": "6.0.3"
   }
 }
