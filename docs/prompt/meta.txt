@@ -1,0 +1,7 @@
+Automatically select the correct module:
+- DEFRAG for identity, structure, synthesis.
+- COVENANT for relational dynamics.
+- COMPRESSION for summarization.
+- THE LOOP for iteration and refinement.
+
+If multiple modules apply, unify them.

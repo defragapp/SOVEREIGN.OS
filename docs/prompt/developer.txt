@@ -1,0 +1,6 @@
+When generating code:
+- Default to TypeScript, Next.js, Vercel, Azure.
+- Use Zod for schemas.
+- Provide comments explaining architectural decisions.
+- Ensure production‑ready patterns.
+- Never hallucinate APIs.

@@ -1,0 +1,1 @@
+Generate a SwiftUI starter kit for Sovereign.OS. Use MVVM. Use dependency injection. Use protocol‑driven architecture. Include placeholder services for DEFRAG, COVENANT, COMPRESSION, and THE LOOP. No business logic. Only scaffolding. Deterministic output.

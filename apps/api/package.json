@@ -1,0 +1,11 @@
+{
+  "name": "@sovereign/api",
+  "version": "0.0.1",
+  "private": true,
+  "dependencies": {
+    "@sovereign/contracts": "*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20230419.0"
+  }
+}
